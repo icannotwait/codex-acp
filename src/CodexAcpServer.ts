@@ -74,6 +74,8 @@ import {
     createUserMessageChunk,
 } from "./ContentChunks";
 
+const CLI_HISTORY_REPLAY_DELAY_MS = 150;
+
 export interface ThreadGoalSnapshot {
     objective: string;
     status: ThreadGoalStatus;
@@ -472,7 +474,11 @@ export class CodexAcpServer {
             thread,
         } = await this.getOrCreateSessionWithHistory(params);
 
-        await this.streamThreadHistory(sessionId, thread);
+        if (this.codexAcpClient.usesCliRuntime()) {
+            this.scheduleThreadHistoryReplay(sessionId, thread);
+        } else {
+            await this.streamThreadHistory(sessionId, thread);
+        }
 
         logger.log("Session loaded", {
             sessionId: sessionId,
@@ -972,6 +978,20 @@ export class CodexAcpServer {
             : threadUpdates;
         for (const update of updates) {
             await session.update(update);
+        }
+    }
+
+    private scheduleThreadHistoryReplay(sessionId: string, thread: Thread): void {
+        const timer = setTimeout(() => {
+            void this.streamThreadHistory(sessionId, thread).catch((error) => {
+                logger.log("Failed to replay delayed CLI history", {
+                    sessionId,
+                    error: error instanceof Error ? error.message : String(error),
+                });
+            });
+        }, CLI_HISTORY_REPLAY_DELAY_MS);
+        if (typeof timer === "object" && "unref" in timer) {
+            timer.unref();
         }
     }
 

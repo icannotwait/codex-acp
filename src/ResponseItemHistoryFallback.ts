@@ -148,7 +148,7 @@ export function parseResponseItemHistoryFallback(
         }
     }
 
-    return recoveredFunctionCall ? updates : null;
+    return recoveredFunctionCall || updates.length > 0 ? updates : null;
 }
 
 function toolCallIdsFromThread(thread: Thread): Set<string> {

@@ -55,6 +55,31 @@ describe("ResponseItemHistoryFallback", () => {
         expect(thoughtTexts(updates)).toEqual(["Need to inspect the directory."]);
     });
 
+    it("recovers visible user and assistant messages without tool calls", () => {
+        const updates = parseResponseItemHistoryFallback(jsonl([
+            {
+                type: "event_msg",
+                payload: {
+                    type: "user_message",
+                    message: "Hi Codex",
+                    images: [],
+                    local_images: [],
+                },
+            },
+            {
+                type: "response_item",
+                payload: {
+                    type: "message",
+                    role: "assistant",
+                    content: [{type: "output_text", text: "Hello from history"}],
+                },
+            },
+        ]), "terminal_output");
+
+        expect(userTexts(updates)).toEqual(["Hi Codex"]);
+        expect(agentTexts(updates)).toEqual(["Hello from history"]);
+    });
+
     it("marks exec command outputs without exit footers failed when they report command errors", () => {
         const updates = parseResponseItemHistoryFallback(jsonl([
             functionCall("call-read-failed", "cat missing.txt"),
@@ -130,6 +155,22 @@ function thoughtTexts(updates: UpdateSessionEvent[] | null): string[] {
     return (updates ?? [])
         .filter((update): update is Extract<UpdateSessionEvent, { sessionUpdate: "agent_thought_chunk" }> => (
             update.sessionUpdate === "agent_thought_chunk"
+        ))
+        .flatMap((update) => update.content.type === "text" ? [update.content.text] : []);
+}
+
+function userTexts(updates: UpdateSessionEvent[] | null): string[] {
+    return (updates ?? [])
+        .filter((update): update is Extract<UpdateSessionEvent, { sessionUpdate: "user_message_chunk" }> => (
+            update.sessionUpdate === "user_message_chunk"
+        ))
+        .flatMap((update) => update.content.type === "text" ? [update.content.text] : []);
+}
+
+function agentTexts(updates: UpdateSessionEvent[] | null): string[] {
+    return (updates ?? [])
+        .filter((update): update is Extract<UpdateSessionEvent, { sessionUpdate: "agent_message_chunk" }> => (
+            update.sessionUpdate === "agent_message_chunk"
         ))
         .flatMap((update) => update.content.type === "text" ? [update.content.text] : []);
 }

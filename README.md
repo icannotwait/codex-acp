@@ -49,12 +49,24 @@ The adapter advertises ACP auth methods during initialization. Clients can authe
 - `CODEX_API_KEY` - API key used when the API-key auth method is selected. Takes precedence over `OPENAI_API_KEY`.
 - `OPENAI_API_KEY` - fallback API key used when the API-key auth method is selected.
 - `CODEX_PATH` - run a specific Codex executable instead of the bundled package dependency.
+- `CODEX_ACP_USE_CLI` - set to `1` to run turns through `codex exec --json` instead of `codex app-server`.
+- `CODEX_ACP_CLI_MODEL` - model advertised to ACP clients when `CODEX_ACP_USE_CLI=1`; defaults to `gpt-5`.
 - `CODEX_CONFIG` - JSON object merged into the Codex session config.
 - `MODEL_PROVIDER` - model provider to pass to Codex for new sessions.
 - `DEFAULT_AUTH_REQUEST` - ACP auth request JSON used when Codex requires authentication.
 - `INITIAL_AGENT_MODE` - initial mode id: `read-only`, `agent`, or `agent-full-access`.
 - `NO_BROWSER` - hide browser-based ChatGPT auth when set.
 - `APP_SERVER_LOGS` - directory for adapter logs.
+
+### Experimental Codex CLI runtime
+
+`CODEX_ACP_USE_CLI=1` keeps the ACP stdio surface but executes prompts with the installed Codex CLI:
+
+```bash
+CODEX_ACP_USE_CLI=1 CODEX_PATH=/opt/homebrew/bin/codex codex-acp
+```
+
+This path forwards ACP `session/new.mcpServers` into Codex CLI `-c mcp_servers...` overrides, so Codeg's `delegate_to_agent` MCP server is still available to the model. It currently maps text, command execution, dynamic/custom tools, MCP tool calls, token usage, cancellation, and session close back into ACP events. App-server-only features such as realtime audio, rich image generation events, app-server session listing, and app-server skill catalog events are intentionally degraded in this first version.
 
 ## Development
 

@@ -40,6 +40,11 @@ import type {
 } from "./app-server/v2";
 import packageJson from "../package.json";
 import type {AuthenticationStatusResponse} from "./AcpExtensions";
+import {
+    CODEX_CLI_RUNTIME_ENV_VAR,
+    CodexCliRuntime,
+    shouldUseCodexCliRuntime,
+} from "./CodexCliRuntime";
 
 /**
  * API for accessing the Codex App Server using ACP requests.
@@ -54,6 +59,7 @@ export class CodexAcpClient {
     private pendingAccountUpdated: Promise<AccountUpdatedNotification> | null = null;
     private readonly sessionNotificationQueues = new Map<string, Promise<void>>();
     private skillExtraRoots: string[] = [];
+    private readonly cliRuntime: CodexCliRuntime | null;
 
 
     constructor(codexClient: CodexAppServerClient, codexConfig?: JsonObject, modelProvider?: string) {
@@ -61,6 +67,7 @@ export class CodexAcpClient {
         this.config = codexConfig ?? {};
         this.modelProvider = modelProvider ?? null;
         this.gatewayConfig = null;
+        this.cliRuntime = shouldUseCodexCliRuntime() ? new CodexCliRuntime() : null;
     }
 
     private readonly defaultClientInfo: ClientInfo = {
@@ -68,6 +75,10 @@ export class CodexAcpClient {
     };
 
     async initialize(request: acp.InitializeRequest): Promise<void> {
+        if (this.cliRuntime) {
+            logger.log(`${CODEX_CLI_RUNTIME_ENV_VAR} enabled: skipping Codex app-server initialize`);
+            return;
+        }
         await this.codexClient.initialize({
             capabilities: null,
             clientInfo: {
@@ -81,6 +92,9 @@ export class CodexAcpClient {
     async authenticate(authRequest: acp.AuthenticateRequest): Promise<Boolean> {
         if (!isCodexAuthRequest(authRequest)) {
             throw RequestError.invalidRequest();
+        }
+        if (this.cliRuntime) {
+            return true;
         }
 
         switch (authRequest.methodId) {
@@ -164,6 +178,12 @@ export class CodexAcpClient {
 
 
     async getAuthenticationStatus(): Promise<AuthenticationStatusResponse> {
+        if (this.cliRuntime) {
+            return {
+                type: "gateway",
+                name: "Codex CLI",
+            };
+        }
         const modelProvider = await this.getCurrentModelProvider();
         if (modelProvider) {
             return {
@@ -196,6 +216,9 @@ export class CodexAcpClient {
     }
 
     async getCurrentModelProvider(): Promise<string | null> {
+        if (this.cliRuntime) {
+            return this.getModelProvider();
+        }
         const sessionModelProvider = this.getModelProvider();
         if (sessionModelProvider !== null) {
             return sessionModelProvider;
@@ -205,12 +228,18 @@ export class CodexAcpClient {
     }
 
     async logout(): Promise<void> {
+        if (this.cliRuntime) {
+            return;
+        }
         const accountUpdatedPromise = this.awaitNextAccountUpdated();
         await this.codexClient.accountLogout();
         await accountUpdatedPromise;
     }
 
     async authRequired(): Promise<Boolean> {
+        if (this.cliRuntime) {
+            return false;
+        }
         if (this.gatewayConfig != null) {
             // The authentication is already in progress:
             // the gateway config is set during the authentication request processing.
@@ -227,12 +256,32 @@ export class CodexAcpClient {
         return this.gatewayConfig !== null;
     }
 
+    usesCliRuntime(): boolean {
+        return this.cliRuntime !== null;
+    }
+
     async getAccount(): Promise<GetAccountResponse> {
+        if (this.cliRuntime) {
+            return {account: null, requiresOpenaiAuth: false};
+        }
         return this.codexClient.accountRead({refreshToken: false});
     }
 
     async resumeSession(request: acp.ResumeSessionRequest, onSubscribed?: () => void): Promise<SessionMetadata> {
         const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);
+        if (this.cliRuntime) {
+            this.cliRuntime.resumeSession(request, additionalDirectories);
+            onSubscribed?.();
+            const models = this.cliRuntime.availableModels();
+            return {
+                sessionId: request.sessionId,
+                currentModelId: this.createModelId(models, request._meta?.["model"] as string | null ?? models[0]!.id, null).toString(),
+                models,
+                modelProvider: this.getModelProvider(),
+                currentServiceTier: null,
+                additionalDirectories,
+            };
+        }
         await this.refreshSkills(request.cwd, additionalDirectories);
 
         const response = await this.codexClient.threadResume({
@@ -256,6 +305,23 @@ export class CodexAcpClient {
 
     async loadSession(request: acp.LoadSessionRequest, onSubscribed?: () => void): Promise<SessionMetadataWithThread> {
         const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);
+        if (this.cliRuntime) {
+            const session = this.cliRuntime.resumeSession({
+                ...request,
+                prompt: [],
+            } as acp.ResumeSessionRequest, additionalDirectories);
+            onSubscribed?.();
+            const models = this.cliRuntime.availableModels();
+            return {
+                sessionId: request.sessionId,
+                currentModelId: this.createModelId(models, models[0]!.id, null).toString(),
+                models,
+                modelProvider: this.getModelProvider(),
+                currentServiceTier: null,
+                thread: this.cliRuntime.threadForSession(session.sessionId),
+                additionalDirectories,
+            };
+        }
         await this.refreshSkills(request.cwd, additionalDirectories);
 
         const response = await this.codexClient.threadResume({
@@ -284,6 +350,18 @@ export class CodexAcpClient {
 
     async newSession(request: acp.NewSessionRequest): Promise<SessionMetadata> {
         const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);
+        if (this.cliRuntime) {
+            const session = this.cliRuntime.createSession(request, additionalDirectories);
+            const models = this.cliRuntime.availableModels();
+            return {
+                sessionId: session.sessionId,
+                currentModelId: this.createModelId(models, models[0]!.id, null).toString(),
+                models,
+                modelProvider: this.getModelProvider(),
+                currentServiceTier: null,
+                additionalDirectories,
+            };
+        }
         await this.refreshSkills(request.cwd, additionalDirectories);
 
         const response = await this.codexClient.threadStart({
@@ -308,6 +386,10 @@ export class CodexAcpClient {
     }
 
     async closeSession(sessionId: string): Promise<void> {
+        if (this.cliRuntime) {
+            this.cliRuntime.closeSession(sessionId);
+            return;
+        }
         try {
             await this.codexClient.threadUnsubscribe({threadId: sessionId});
         } finally {
@@ -316,6 +398,10 @@ export class CodexAcpClient {
     }
 
     async deleteSession(sessionId: string): Promise<void> {
+        if (this.cliRuntime) {
+            this.cliRuntime.closeSession(sessionId);
+            return;
+        }
         await this.codexClient.threadArchive({threadId: sessionId});
     }
 
@@ -369,10 +455,16 @@ export class CodexAcpClient {
     }
 
     async awaitMcpServerStartup(serverNames: Array<string>, afterVersion: number): Promise<McpStartupResult> {
+        if (this.cliRuntime) {
+            return {ready: serverNames, failed: [], cancelled: []};
+        }
         return await this.codexClient.awaitMcpServerStartup(serverNames, afterVersion);
     }
 
     getMcpServerStartupVersion(): number {
+        if (this.cliRuntime) {
+            return 0;
+        }
         return this.codexClient.getMcpServerStartupVersion();
     }
 
@@ -436,6 +528,9 @@ export class CodexAcpClient {
         cwd: string,
         additionalRoots: string[]
     ): Promise<void> {
+        if (this.cliRuntime) {
+            return;
+        }
         if (!cwd) {
             return;
         }
@@ -512,6 +607,12 @@ export class CodexAcpClient {
         approvalHandler: ApprovalHandler,
         elicitationHandler: ElicitationHandler
     ) {
+        if (this.cliRuntime) {
+            this.cliRuntime.onServerNotification(sessionId, (event) => {
+                this.enqueueSessionNotification(sessionId, () => eventHandler(event));
+            });
+            return;
+        }
         this.codexClient.onServerNotification(sessionId, (event) => {
             this.enqueueSessionNotification(sessionId, () => eventHandler(event));
         });
@@ -575,6 +676,22 @@ export class CodexAcpClient {
         onTurnStarted?: (turnId: string) => void,
         shouldCancel?: () => boolean,
     ): Promise<TurnCompletedNotification | null> {
+        if (this.cliRuntime) {
+            const cliPrompt = {
+                request,
+                agentMode,
+                modelId,
+                serviceTier,
+                disableSummary,
+                cwd,
+                additionalDirectories,
+            };
+            return await this.cliRuntime.runPrompt({
+                ...cliPrompt,
+                ...(onTurnStarted ? {onTurnStarted} : {}),
+                ...(shouldCancel ? {shouldCancel} : {}),
+            });
+        }
         const input = buildPromptItems(request.prompt);
         const effort = modelId.effort as ReasoningEffort | null; //TODO remove unsafe conversion
         await this.refreshSkills(cwd, additionalDirectories);
@@ -594,14 +711,23 @@ export class CodexAcpClient {
     }
 
     resolveTurnInterrupted(params: { threadId: string, turnId: string }): void {
+        if (this.cliRuntime) {
+            return;
+        }
         this.codexClient.resolveTurnInterrupted(params.threadId, params.turnId);
     }
 
     markTurnStale(params: { threadId: string, turnId: string }): void {
+        if (this.cliRuntime) {
+            return;
+        }
         this.codexClient.markTurnStale(params.threadId, params.turnId);
     }
 
     async listSkills(params?: SkillsListParams): Promise<SkillsListResponse> {
+        if (this.cliRuntime) {
+            return {data: []};
+        }
         return this.codexClient.listSkills(params ?? {});
     }
 
@@ -649,10 +775,16 @@ export class CodexAcpClient {
     }
 
     async listMcpServers(): Promise<ListMcpServerStatusResponse> {
+        if (this.cliRuntime) {
+            return {data: [], nextCursor: null};
+        }
         return this.codexClient.listMcpServerStatus({});
     }
 
     async listSessions(request: acp.ListSessionsRequest): Promise<acp.ListSessionsResponse> {
+        if (this.cliRuntime) {
+            return this.cliRuntime.listSessions(request.cwd ?? null);
+        }
         const sourceKinds: ThreadSourceKind[] = [
             "cli",
             "vscode",
@@ -709,6 +841,10 @@ export class CodexAcpClient {
     }
 
     async turnInterrupt(params: { threadId: string, turnId: string }): Promise<void> {
+        if (this.cliRuntime) {
+            this.cliRuntime.abortSession(params.threadId);
+            return;
+        }
         await this.codexClient.turnInterrupt({
             threadId: params.threadId,
             turnId: params.turnId
@@ -716,6 +852,9 @@ export class CodexAcpClient {
     }
 
     async fetchAvailableModels(): Promise<Model[]> {
+        if (this.cliRuntime) {
+            return this.cliRuntime.availableModels();
+        }
         const models: Model[] = [];
         let cursor: string | null = null;
 

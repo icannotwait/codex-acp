@@ -12,6 +12,8 @@ Set `CODEX_PATH` to run a different Codex binary; versions other than the one sp
 - `INITIAL_AGENT_MODE` - initial mode id: `read-only`, `agent`, or `agent-full-access`.
 - `NO_BROWSER` - hide browser-based ChatGPT auth when set.
 - `APP_SERVER_LOGS` - directory for adapter logs.
+- `CODEX_ACP_USE_CLI` - set to `1` to keep ACP but execute turns with `codex exec --json`.
+- `CODEX_ACP_CLI_MODEL` - model advertised in CLI runtime mode; defaults to `gpt-5`.
 
 ### Quick start
 

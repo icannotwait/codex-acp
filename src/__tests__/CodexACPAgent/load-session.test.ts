@@ -547,6 +547,106 @@ describe("CodexACPAgent - loadSession", () => {
         }
     });
 
+    it("delays CLI runtime history replay until after loadSession returns", async () => {
+        const fixture = createCodexMockTestFixture();
+        const codexAcpAgent = fixture.getCodexAcpAgent();
+        const codexAcpClient = fixture.getCodexAcpClient();
+        const codexAppServerClient = fixture.getCodexAppServerClient();
+        const tempDir = await mkdtemp(join(tmpdir(), "codex-acp-cli-history-"));
+
+        try {
+            const rolloutPath = join(tempDir, "rollout.jsonl");
+            await writeFile(
+                rolloutPath,
+                `${[
+                    {
+                        type: "event_msg",
+                        payload: {
+                            type: "user_message",
+                            message: "Hi from CLI history",
+                            images: [],
+                            local_images: [],
+                        },
+                    },
+                    {
+                        type: "response_item",
+                        payload: {
+                            type: "message",
+                            role: "assistant",
+                            content: [{ type: "output_text", text: "Hello from CLI history" }],
+                        },
+                    },
+                ].map((record) => JSON.stringify(record)).join("\n")}\n`,
+                "utf8",
+            );
+
+            codexAcpClient.authRequired = vi.fn().mockResolvedValue(false);
+            codexAcpClient.getAccount = vi.fn().mockResolvedValue({
+                account: null,
+                requiresOpenaiAuth: false,
+            });
+            codexAcpClient.listSkills = vi.fn().mockResolvedValue({ data: [] });
+            (codexAcpClient as unknown as { usesCliRuntime: () => boolean }).usesCliRuntime = vi.fn().mockReturnValue(true);
+
+            const model = createTestModel({ id: "gpt-5.2", displayName: "GPT-5.2" });
+            codexAppServerClient.listModels = vi.fn().mockResolvedValue({
+                data: [model],
+                nextCursor: null,
+            });
+
+            const thread: Thread = {
+                id: "session-cli",
+                sessionId: "session-cli",
+                parentThreadId: null,
+                threadSource: "exec",
+                forkedFromId: null,
+                preview: "Hi from CLI history",
+                ephemeral: false,
+                modelProvider: "openai",
+                createdAt: 123,
+                updatedAt: 124,
+                recencyAt: null,
+                status: { type: "idle" },
+                path: rolloutPath,
+                cwd: "/test/project",
+                cliVersion: "codex-cli",
+                source: "exec",
+                agentNickname: null,
+                agentRole: null,
+                gitInfo: null,
+                name: null,
+                turns: [],
+            };
+            codexAppServerClient.threadResume = vi.fn().mockResolvedValue({
+                thread,
+                model: model.id,
+                modelProvider: "openai",
+                cwd: "/test/project",
+                approvalPolicy: "never",
+                sandbox: { type: "dangerFullAccess" },
+                reasoningEffort: model.defaultReasoningEffort,
+            });
+            codexAppServerClient.threadRead = vi.fn().mockResolvedValue({ thread });
+
+            await codexAcpAgent.initialize({ protocolVersion: 1 });
+            await codexAcpAgent.loadSession({
+                sessionId: thread.id,
+                cwd: "/test/project",
+                mcpServers: [],
+            });
+
+            expect(fixture.getAcpConnectionDump([])).not.toContain("Hi from CLI history");
+
+            await new Promise(resolve => setTimeout(resolve, 200));
+
+            const replayed = fixture.getAcpConnectionDump([]);
+            expect(replayed).toContain("Hi from CLI history");
+            expect(replayed).toContain("Hello from CLI history");
+        } finally {
+            await rm(tempDir, { recursive: true, force: true });
+        }
+    });
+
     it("publishes MCP startup failure for explicitly requested servers during loadSession", async () => {
         const fixture = createCodexMockTestFixture();
         const codexAcpAgent = fixture.getCodexAcpAgent();
