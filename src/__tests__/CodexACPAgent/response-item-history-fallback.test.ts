@@ -80,6 +80,26 @@ describe("ResponseItemHistoryFallback", () => {
         expect(agentTexts(updates)).toEqual(["Hello from history"]);
     });
 
+    it("preserves assistant message phase metadata from response items", () => {
+        const updates = parseResponseItemHistoryFallback(jsonl([
+            {
+                type: "response_item",
+                payload: {
+                    type: "message",
+                    role: "assistant",
+                    content: [{ type: "output_text", text: "Final answer text." }],
+                    phase: "final_answer",
+                },
+            },
+            functionCall("call-missing", "ls"),
+            functionCallOutput("call-missing", "Chunk ID: missing\nProcess exited with code 0\nOutput:\nREADME.md\n"),
+        ]), "terminal_output");
+
+        expect(agentMessageMetas(updates)).toEqual([
+            { codex: { phase: "final_answer" } },
+        ]);
+    });
+
     it("marks exec command outputs without exit footers failed when they report command errors", () => {
         const updates = parseResponseItemHistoryFallback(jsonl([
             functionCall("call-read-failed", "cat missing.txt"),
@@ -173,4 +193,12 @@ function agentTexts(updates: UpdateSessionEvent[] | null): string[] {
             update.sessionUpdate === "agent_message_chunk"
         ))
         .flatMap((update) => update.content.type === "text" ? [update.content.text] : []);
+}
+
+function agentMessageMetas(updates: UpdateSessionEvent[] | null): unknown[] {
+    return (updates ?? [])
+        .filter((update): update is Extract<UpdateSessionEvent, { sessionUpdate: "agent_message_chunk" }> => (
+            update.sessionUpdate === "agent_message_chunk"
+        ))
+        .map((update) => update._meta);
 }

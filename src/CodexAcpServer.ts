@@ -15,7 +15,6 @@ import type {
     Thread,
     ThreadGoalStatus,
     ThreadItem,
-    TurnCompletedNotification,
     UserInput
 } from "./app-server/v2";
 import type {RateLimitsMap} from "./RateLimitsMap";
@@ -69,6 +68,7 @@ import packageJson from "../package.json";
 import {isJetBrains2026_1Client} from "./JBUtils";
 import {resolveTerminalOutputMode, type TerminalOutputMode} from "./TerminalOutputMode";
 import {
+    createCodexMessagePhaseMeta,
     createAgentTextMessageChunk,
     createAgentTextThoughtChunk,
     createUserMessageChunk,
@@ -146,6 +146,7 @@ export class CodexAcpServer {
     private readonly getRecentStderr: () => string;
     private readonly availableCommands: CodexCommands;
     private clientInfo: acp.Implementation | null;
+    private clientCapabilities: acp.ClientCapabilities | null;
     private terminalOutputMode: TerminalOutputMode;
     private booleanConfigOptionsSupported: boolean;
 
@@ -177,6 +178,7 @@ export class CodexAcpServer {
         this.getExitCode = getExitCode ?? (() => null);
         this.getRecentStderr = getRecentStderr ?? (() => "");
         this.clientInfo = null;
+        this.clientCapabilities = null;
         this.terminalOutputMode = "terminal_output_delta";
         this.booleanConfigOptionsSupported = false;
         this.availableCommands = new CodexCommands(
@@ -192,6 +194,7 @@ export class CodexAcpServer {
     ): Promise<acp.InitializeResponse> {
         logger.log("Initialize request received");
         this.clientInfo = _params.clientInfo ?? null;
+        this.clientCapabilities = _params.clientCapabilities ?? null;
         this.terminalOutputMode = resolveTerminalOutputMode(_params.clientCapabilities);
         this.booleanConfigOptionsSupported = clientSupportsBooleanConfigOptions(_params.clientCapabilities);
         await this.runWithProcessCheck(() => this.codexAcpClient.initialize(_params));
@@ -206,6 +209,7 @@ export class CodexAcpServer {
                 auth: {
                     logout: {},
                 },
+                providers: {},
                 loadSession: true,
                 promptCapabilities: {
                     embeddedContext: true,
@@ -637,6 +641,20 @@ export class CodexAcpServer {
         logger.log("Logout request completed");
     }
 
+    listProviders(_params: acp.ListProvidersRequest): acp.ListProvidersResponse {
+        return { providers: this.codexAcpClient.listProviders() };
+    }
+
+    setProvider(params: acp.SetProviderRequest): acp.SetProviderResponse {
+        this.codexAcpClient.setProvider(params);
+        return { };
+    }
+
+    disableProvider(params: acp.DisableProviderRequest): acp.DisableProviderResponse {
+        this.codexAcpClient.disableProvider(params);
+        return { };
+    }
+
     private async refreshSessionsAuthState(authProvider: string | null): Promise<void> {
         if (this.sessions.size === 0) return;
 
@@ -1003,12 +1021,15 @@ export class CodexAcpServer {
             case "subAgentActivity":
             case "sleep":
                 return [];
-            case "agentMessage":
+            case "agentMessage": {
+                const meta = createCodexMessagePhaseMeta(item.phase);
                 return [{
                     sessionUpdate: "agent_message_chunk",
                     messageId: item.id,
                     content: { type: "text", text: item.text },
+                    ...(meta ? { _meta: meta } : {}),
                 }];
+            }
             case "reasoning":
                 return this.createReasoningUpdates(item);
             case "fileChange":
@@ -1457,10 +1478,15 @@ export class CodexAcpServer {
         try {
             const eventHandler = new CodexEventHandler(this.connection, sessionState);
             const approvalHandler = new CodexApprovalHandler(this.connection, sessionState, activePrompt.signal);
-            const elicitationHandler = new CodexElicitationHandler(this.connection, sessionState, activePrompt.signal);
+            const elicitationHandler = new CodexElicitationHandler(
+                this.connection,
+                sessionState,
+                this.clientCapabilities,
+                activePrompt.signal,
+            );
             await this.codexAcpClient.subscribeToSessionEvents(params.sessionId,
-                (event) => {
-                    elicitationHandler.handleNotification(event);
+                async (event) => {
+                    await elicitationHandler.handleNotification(event);
                     return eventHandler.handleNotification(event);
                 },
                 approvalHandler,
