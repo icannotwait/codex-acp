@@ -500,6 +500,9 @@ export class CodexAcpClient {
     }
 
     async runCompact(sessionId: string): Promise<void> {
+        if (this.cliRuntime) {
+            throw RequestError.invalidRequest("Codex CLI runtime runs compact through the /compact prompt");
+        }
         await this.codexClient.runCompact({threadId: sessionId});
     }
 

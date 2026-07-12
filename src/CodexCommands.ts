@@ -8,6 +8,8 @@ import type {RateLimitsMap} from "./RateLimitsMap";
 import type {TokenCount} from "./TokenCount";
 import {logger} from "./Logger";
 import {createAgentTextMessageChunk} from "./ContentChunks";
+import {ModelId} from "./ModelId";
+import {resolveFastServiceTier} from "./FastModeConfig";
 
 type ParsedSlashCommand = {
     name: string;
@@ -21,6 +23,7 @@ export type CommandHandleResult =
 export type CommandHandleOptions = {
     onTurnStartPending?: () => void;
     onTurnStarted?: (turnId: string, threadId: string) => void;
+    shouldCancel?: () => boolean;
 };
 
 export type LogoutHandler = () => void | Promise<void>;
@@ -174,6 +177,10 @@ export class CodexCommands {
         const sessionId = sessionState.sessionId;
         switch (commandName) {
             case "compact": {
+                if (this.codexAcpClient.usesCliRuntime()) {
+                    const turnCompleted = await this.runCliCompactCommand(sessionState, options);
+                    return this.createGoalCommandResult(turnCompleted);
+                }
                 await this.runWithProcessCheck(() => this.codexAcpClient.runCompact(sessionId));
                 return { handled: true };
             }
@@ -257,6 +264,38 @@ export class CodexCommands {
                 await this.sendUnknownCommandMessage(commandName, sessionId);
                 return { handled: true };
         }
+    }
+
+    private async runCliCompactCommand(
+        sessionState: SessionState,
+        options: CommandHandleOptions,
+    ): Promise<TurnCompletedNotification | null> {
+        options.onTurnStartPending?.();
+        const modelId = ModelId.fromString(sessionState.currentModelId);
+        const modelLacksReasoning = sessionState.supportedReasoningEfforts.length > 0
+            && sessionState.supportedReasoningEfforts.every(e => e.reasoningEffort === "none");
+        const disableSummary = sessionState.account?.type === "apiKey" || modelLacksReasoning;
+        const serviceTier = resolveFastServiceTier(
+            sessionState.fastModeEnabled,
+            sessionState.currentModelSupportsFast,
+        );
+
+        return await this.runWithProcessCheck(() => this.codexAcpClient.sendPrompt(
+            {
+                sessionId: sessionState.sessionId,
+                prompt: [{type: "text", text: "/compact"}],
+            },
+            sessionState.agentMode,
+            modelId,
+            serviceTier,
+            disableSummary,
+            sessionState.cwd,
+            sessionState.additionalDirectories,
+            (turnId) => {
+                this.handleCommandTurnStarted(sessionState, options, turnId, sessionState.sessionId);
+            },
+            options.shouldCancel,
+        ));
     }
 
     private async runReviewCommand(

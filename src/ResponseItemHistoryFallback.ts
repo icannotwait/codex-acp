@@ -104,7 +104,8 @@ export function parseResponseItemHistoryFallback(
             case "reasoning":
                 pushUpdates(createReasoningUpdates(item));
                 break;
-            case "function_call": {
+            case "function_call":
+            case "custom_tool_call": {
                 const toolCallId = stringValue(item["call_id"]);
                 if (toolCallId && existingToolCallIds.has(toolCallId)) {
                     skippedToolCallIds.add(toolCallId);
@@ -128,7 +129,8 @@ export function parseResponseItemHistoryFallback(
                 pushUpdates([result.update]);
                 break;
             }
-            case "function_call_output": {
+            case "function_call_output":
+            case "custom_tool_call_output": {
                 const toolCallId = stringValue(item["call_id"]);
                 if (toolCallId && skippedToolCallIds.has(toolCallId)) {
                     break;
@@ -219,6 +221,8 @@ function isLegacyResponseItemType(type: string): boolean {
         case "reasoning":
         case "function_call":
         case "function_call_output":
+        case "custom_tool_call":
+        case "custom_tool_call_output":
             return true;
         default:
             return false;
@@ -369,7 +373,7 @@ function createFunctionCallUpdate(item: JsonRecord): LegacyFunctionCallUpdate | 
     }
 
     const isExecCommand = name === "exec_command";
-    const args = parseFunctionArguments(item["arguments"]);
+    const args = parseFunctionArguments(item["arguments"] ?? item["input"]);
     const command = isExecCommand ? commandFromFunctionArguments(args) : null;
     const cwd = isExecCommand ? cwdFromFunctionArguments(args) : "";
     const commandAction = command ? inferCommandAction(command, cwd) : null;

@@ -1510,6 +1510,7 @@ export class CodexAcpServer {
                     sessionState.currentTurnId = turnId;
                     pendingTurnStart?.resolve(turnId);
                 },
+                shouldCancel: () => this.promptShouldStop(params.sessionId, activePrompt),
             });
             void commandPromise.catch((err) => {
                 if (this.activePrompts.get(params.sessionId) !== activePrompt) {

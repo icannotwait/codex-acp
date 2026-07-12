@@ -50,7 +50,7 @@ The adapter advertises ACP auth methods during initialization. Clients can authe
 - `OPENAI_API_KEY` - fallback API key used when the API-key auth method is selected.
 - `CODEX_PATH` - run a specific Codex executable instead of the bundled package dependency.
 - `CODEX_ACP_USE_CLI` - set to `1` to run turns through `codex exec --json` instead of `codex app-server`.
-- `CODEX_ACP_CLI_MODEL` - model advertised to ACP clients when `CODEX_ACP_USE_CLI=1`; defaults to `gpt-5`.
+- `CODEX_ACP_CLI_MODEL` - model advertised to ACP clients and passed to `codex exec` when `CODEX_ACP_USE_CLI=1`; defaults to `gpt-5`.
 - `CODEX_CONFIG` - JSON object merged into the Codex session config.
 - `MODEL_PROVIDER` - model provider to pass to Codex for new sessions.
 - `DEFAULT_AUTH_REQUEST` - ACP auth request JSON used when Codex requires authentication.

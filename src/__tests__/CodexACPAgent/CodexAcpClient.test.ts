@@ -1,6 +1,9 @@
 // noinspection ES6RedundantAwait
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR, type CodexAuthRequest} from "../../CodexAuthMethod";
 import type * as acp from "@agentclientprotocol/sdk";
 import {
@@ -1491,6 +1494,52 @@ describe('ACP server test', { timeout: 40_000 }, () => {
         expect(promptResolved).toBe(true);
         expect(turnStartSpy).not.toHaveBeenCalled();
         expect(mockFixture.getAcpConnectionDump([])).toContain("Context compacted");
+    });
+
+    it('handles compact slash command inside Codex CLI runtime without app-server', async () => {
+        const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-acp-cli-compact-test-"));
+        const fakeCodex = path.join(temp, "codex");
+        const codexHome = path.join(temp, "codex-home");
+        fs.writeFileSync(fakeCodex, `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const threadId = "cli-thread-compact";
+const rolloutDir = path.join(process.env.CODEX_HOME, "sessions", "2026", "07", "06");
+fs.mkdirSync(rolloutDir, {recursive: true});
+fs.writeFileSync(path.join(rolloutDir, "rollout-2026-07-06T00-00-00-cli-thread-compact.jsonl"), [
+  JSON.stringify({type: "session_meta", payload: {session_id: threadId, id: threadId, cwd: process.cwd()}}),
+  JSON.stringify({type: "compacted", payload: {message: "summary", replacement_history: []}}),
+  JSON.stringify({type: "event_msg", payload: {type: "context_compacted"}}),
+].join("\\n") + "\\n");
+console.log(JSON.stringify({type: "thread.started", thread_id: threadId}));
+console.log(JSON.stringify({type: "turn.started"}));
+console.log(JSON.stringify({type: "turn.completed"}));
+`, "utf8");
+        fs.chmodSync(fakeCodex, 0o755);
+        vi.stubEnv("CODEX_ACP_USE_CLI", "1");
+        vi.stubEnv("CODEX_ACP_CLI_MODEL", "gpt-5");
+        vi.stubEnv("CODEX_PATH", fakeCodex);
+        vi.stubEnv("CODEX_HOME", codexHome);
+
+        const mockFixture = createCodexMockTestFixture();
+        const compactStartSpy = vi.spyOn(mockFixture.getCodexAppServerClient(), "threadCompactStart")
+            .mockRejectedValue(new Error("Not initialized"));
+
+        await mockFixture.getCodexAcpAgent().initialize({protocolVersion: 1});
+        const {sessionId} = await mockFixture.getCodexAcpAgent().newSession({cwd: temp, mcpServers: []});
+
+        try {
+            const response = await mockFixture.getCodexAcpAgent().prompt({
+                sessionId,
+                prompt: [{type: "text", text: "/compact"}],
+            });
+
+            expect(response.stopReason).toBe("end_turn");
+            expect(compactStartSpy).not.toHaveBeenCalled();
+            expect(mockFixture.getAcpConnectionDump([])).toContain("Context compacted");
+        } finally {
+            fs.rmSync(temp, {recursive: true, force: true});
+        }
     });
 
     it('handles goal slash commands through Codex app server', async () => {

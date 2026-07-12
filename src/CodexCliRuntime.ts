@@ -11,6 +11,7 @@ import type {
     Model,
     Thread,
     ThreadItem,
+    TokenUsageBreakdown,
     Turn,
     TurnCompletedNotification,
 } from "./app-server/v2";
@@ -29,6 +30,7 @@ interface CliSession {
     activeChild: ChildProcess | null;
     lastPrompt: string | null;
     updatedAt: number;
+    lastKnownCompactionCount: number;
 }
 
 interface PersistedCliSession {
@@ -46,6 +48,8 @@ interface CliRunState {
     startedAt: number;
     items: ThreadItem[];
     completed: TurnCompletedNotification | null;
+    compactionCountBefore: number;
+    isCompactPrompt: boolean;
 }
 
 type CliJsonEvent = {
@@ -55,9 +59,22 @@ type CliJsonEvent = {
     usage?: Record<string, unknown>;
 };
 
+type RolloutTokenUsage = {
+    last: TokenUsageBreakdown;
+    total: TokenUsageBreakdown;
+    modelContextWindow: number | null;
+};
+
+type RolloutUserMessage = {
+    text: string;
+    internalChatMessageMetadataPassthrough: unknown;
+};
+
 const CLI_RUNTIME_ENV_VAR = "CODEX_ACP_USE_CLI";
 const DEFAULT_CLI_MODEL = "gpt-5";
 const CLI_SESSION_MAP_FILENAME = "codeg-codex-acp-cli-sessions.json";
+const SUMMARY_PREFIX = "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
+const COMPACT_USER_MESSAGE_MAX_ESTIMATED_TOKENS = 20_000;
 
 export function shouldUseCodexCliRuntime(): boolean {
     return process.env[CLI_RUNTIME_ENV_VAR] === "1";
@@ -79,6 +96,7 @@ export class CodexCliRuntime {
             activeChild: null,
             lastPrompt: null,
             updatedAt: Date.now(),
+            lastKnownCompactionCount: 0,
         };
         this.sessions.set(sessionId, session);
         return session;
@@ -87,16 +105,18 @@ export class CodexCliRuntime {
     resumeSession(request: acp.ResumeSessionRequest, additionalDirectories: string[]): CliSession {
         const persisted = readPersistedCliSession(request.sessionId);
         const cliThreadId = persisted?.cliThreadId ?? request.sessionId;
+        const cliRolloutPath = persisted?.cliRolloutPath ?? findCodexRolloutPath(cliThreadId);
         const session: CliSession = {
             sessionId: request.sessionId,
             cliThreadId,
-            cliRolloutPath: persisted?.cliRolloutPath ?? findCodexRolloutPath(cliThreadId),
+            cliRolloutPath,
             cwd: request.cwd || persisted?.cwd || process.cwd(),
             additionalDirectories,
             mcpServers: request.mcpServers ?? [],
             activeChild: null,
             lastPrompt: persisted?.lastPrompt ?? null,
             updatedAt: persisted?.updatedAt ?? Date.now(),
+            lastKnownCompactionCount: cliRolloutPath ? countCodexCompactions(cliRolloutPath) : 0,
         };
         this.sessions.set(request.sessionId, session);
         return session;
@@ -160,6 +180,7 @@ export class CodexCliRuntime {
         const prompt = promptText(params.request.prompt);
         session.lastPrompt = prompt.slice(0, 160);
         session.updatedAt = Date.now();
+        const isCompactPrompt = prompt.trim() === "/compact";
 
         const turnId = crypto.randomUUID();
         const state: CliRunState = {
@@ -168,6 +189,8 @@ export class CodexCliRuntime {
             startedAt: Date.now(),
             items: [],
             completed: null,
+            compactionCountBefore: session.lastKnownCompactionCount,
+            isCompactPrompt,
         };
         this.emit(session.sessionId, {
             method: "turn/started",
@@ -236,6 +259,11 @@ export class CodexCliRuntime {
             threadId: session.sessionId,
             turn: createTurn(turnId, "completed", state.items, state.startedAt),
         };
+        const syntheticCompactUsage = this.installCliCompactionIfNeeded(state);
+        this.emitNewCompactions(state);
+        if (syntheticCompactUsage) {
+            this.emitTokenUsageUpdated(state, syntheticCompactUsage);
+        }
         this.emit(session.sessionId, {
             method: "turn/completed",
             params: completed,
@@ -244,8 +272,7 @@ export class CodexCliRuntime {
     }
 
     availableModels(): Model[] {
-        const model = process.env["CODEX_ACP_CLI_MODEL"]?.trim() || DEFAULT_CLI_MODEL;
-        return [createVirtualModel(model)];
+        return [createVirtualModel(advertisedCliModel())];
     }
 
     threadForSession(sessionId: string): Thread {
@@ -481,9 +508,79 @@ export class CodexCliRuntime {
         if (!session.cliThreadId) {
             return;
         }
-        session.cliRolloutPath = session.cliRolloutPath ?? findCodexRolloutPath(session.cliThreadId);
+        this.refreshSessionRolloutPath(session);
         ensureCodegSessionAlias(session);
         persistCliSession(session);
+    }
+
+    private refreshSessionRolloutPath(session: CliSession): void {
+        if (!session.cliThreadId) {
+            return;
+        }
+        session.cliRolloutPath = findCodexRolloutPath(session.cliThreadId) ?? session.cliRolloutPath;
+    }
+
+    private emitNewCompactions(state: CliRunState): void {
+        this.refreshSessionRolloutPath(state.session);
+        const compactionCountAfter = state.session.cliRolloutPath
+            ? countCodexCompactions(state.session.cliRolloutPath)
+            : state.compactionCountBefore;
+        state.session.lastKnownCompactionCount = compactionCountAfter;
+        const newCompactions = compactionCountAfter - state.compactionCountBefore;
+        if (newCompactions <= 0) {
+            return;
+        }
+        for (let index = 0; index < newCompactions; index += 1) {
+            this.emit(state.session.sessionId, {
+                method: "thread/compacted",
+                params: {
+                    threadId: state.session.sessionId,
+                    turnId: index === 0 ? state.turnId : crypto.randomUUID(),
+                },
+            } as ServerNotification);
+        }
+    }
+
+    private installCliCompactionIfNeeded(state: CliRunState): RolloutTokenUsage | null {
+        if (!state.isCompactPrompt) {
+            return null;
+        }
+
+        this.refreshSessionRolloutPath(state.session);
+        const rolloutPath = state.session.cliRolloutPath;
+        if (!rolloutPath) {
+            logger.log("Cannot install Codex CLI compacted rollout without rollout path", {
+                sessionId: state.session.sessionId,
+                cliThreadId: state.session.cliThreadId,
+            });
+            return null;
+        }
+
+        if (countCodexCompactions(rolloutPath) > state.compactionCountBefore) {
+            return latestCodexTokenUsage(rolloutPath);
+        }
+
+        const summary = compactSummaryFromTurn(state);
+        if (!summary) {
+            logger.log("Cannot install Codex CLI compacted rollout without compact summary", {
+                sessionId: state.session.sessionId,
+                rolloutPath,
+            });
+            return null;
+        }
+
+        return appendSyntheticCompaction(rolloutPath, summary);
+    }
+
+    private emitTokenUsageUpdated(state: CliRunState, usage: RolloutTokenUsage): void {
+        this.emit(state.session.sessionId, {
+            method: "thread/tokenUsage/updated",
+            params: {
+                threadId: state.session.sessionId,
+                turnId: state.turnId,
+                tokenUsage: usage,
+            },
+        } as ServerNotification);
     }
 }
 
@@ -499,7 +596,7 @@ function buildCodexExecArgs(params: {
     const isResume = params.session.cliThreadId !== null;
     args.push("exec");
     args.push("--json", "--skip-git-repo-check", "-C", params.session.cwd);
-    args.push("-m", params.modelId.model);
+    args.push("-m", runtimeCliModel(params.modelId.model));
     args.push("-s", codexSandboxArg(params.agentMode));
     if (params.disableSummary) {
         args.push("-c", "model_reasoning_summary=\"none\"");
@@ -617,6 +714,14 @@ function codexSandboxArg(agentMode: AgentMode): string {
 
 function resolveCodexPath(): string {
     return process.env["CODEX_PATH"]?.trim() || "codex";
+}
+
+function advertisedCliModel(): string {
+    return process.env["CODEX_ACP_CLI_MODEL"]?.trim() || DEFAULT_CLI_MODEL;
+}
+
+function runtimeCliModel(requestedModel: string): string {
+    return process.env["CODEX_ACP_CLI_MODEL"]?.trim() || requestedModel;
 }
 
 function codexHome(): string {
@@ -749,6 +854,350 @@ function findCodexRolloutPath(sessionId: string): string | null {
     }
 
     return null;
+}
+
+function countCodexCompactions(rolloutPath: string): number {
+    let compactedItems = 0;
+    let contextCompactedEvents = 0;
+    let text: string;
+    try {
+        text = fs.readFileSync(rolloutPath, "utf8");
+    } catch {
+        return 0;
+    }
+
+    for (const line of text.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("{")) {
+            continue;
+        }
+        let record: Record<string, unknown>;
+        try {
+            record = JSON.parse(trimmed) as Record<string, unknown>;
+        } catch {
+            continue;
+        }
+        if (record["type"] === "compacted") {
+            compactedItems += 1;
+            continue;
+        }
+        if (record["type"] !== "event_msg") {
+            continue;
+        }
+        const payload = record["payload"];
+        if (
+            payload &&
+            typeof payload === "object" &&
+            !Array.isArray(payload) &&
+            (payload as Record<string, unknown>)["type"] === "context_compacted"
+        ) {
+            contextCompactedEvents += 1;
+        }
+    }
+
+    return compactedItems > 0 ? compactedItems : contextCompactedEvents;
+}
+
+function compactSummaryFromTurn(state: CliRunState): string | null {
+    for (const item of state.items.slice().reverse()) {
+        if (item.type === "agentMessage" && item.text.trim().length > 0) {
+            return item.text.trim();
+        }
+    }
+    return null;
+}
+
+function appendSyntheticCompaction(rolloutPath: string, summary: string): RolloutTokenUsage | null {
+    const latestUsage = latestCodexTokenUsage(rolloutPath);
+    const windowState = latestCompactionWindowState(rolloutPath);
+    const userMessages = selectRecentUserMessages(collectRolloutUserMessages(rolloutPath));
+    const summaryText = summary.startsWith(`${SUMMARY_PREFIX}\n`)
+        ? summary
+        : `${SUMMARY_PREFIX}\n${summary}`;
+    const replacementHistory = [
+        ...userMessages.map(userMessageToResponseItem),
+        userMessageToResponseItem({
+            text: summaryText,
+            internalChatMessageMetadataPassthrough: null,
+        }),
+    ];
+    const windowId = uuidV7();
+    const firstWindowId = windowState.firstWindowId ?? windowState.windowId ?? uuidV7();
+    const compactedPayload = {
+        message: summaryText,
+        replacement_history: replacementHistory,
+        window_number: windowState.windowNumber === null ? 1 : windowState.windowNumber + 1,
+        first_window_id: firstWindowId,
+        previous_window_id: windowState.windowId,
+        window_id: windowId,
+    };
+    const last = estimateTokenUsageForReplacementHistory(replacementHistory);
+    const total = latestUsage?.total ?? last;
+    const modelContextWindow = latestUsage?.modelContextWindow ?? null;
+    const timestamp = new Date().toISOString();
+    const tokenCountInfo = {
+        total_token_usage: toSnakeTokenUsage(total),
+        last_token_usage: toSnakeTokenUsage(last),
+        model_context_window: modelContextWindow,
+    };
+
+    try {
+        fs.appendFileSync(rolloutPath, [
+            JSON.stringify({timestamp, type: "compacted", payload: compactedPayload}),
+            JSON.stringify({timestamp, type: "event_msg", payload: {type: "context_compacted"}}),
+            JSON.stringify({timestamp, type: "event_msg", payload: {type: "token_count", info: tokenCountInfo}}),
+        ].join("\n") + "\n", "utf8");
+    } catch (error) {
+        logger.log("Failed to append synthetic Codex CLI compacted rollout", {
+            rolloutPath,
+            error: error instanceof Error ? error.message : String(error),
+        });
+        return null;
+    }
+
+    return {last, total, modelContextWindow};
+}
+
+function uuidV7(): string {
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    const timestamp = Date.now();
+
+    bytes[0] = Math.floor(timestamp / 2 ** 40) & 0xff;
+    bytes[1] = Math.floor(timestamp / 2 ** 32) & 0xff;
+    bytes[2] = Math.floor(timestamp / 2 ** 24) & 0xff;
+    bytes[3] = Math.floor(timestamp / 2 ** 16) & 0xff;
+    bytes[4] = Math.floor(timestamp / 2 ** 8) & 0xff;
+    bytes[5] = timestamp & 0xff;
+    bytes[6] = (bytes[6]! & 0x0f) | 0x70;
+    bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+
+    return Buffer.from(bytes).toString("hex").replace(
+        /(.{8})(.{4})(.{4})(.{4})(.{12})/,
+        "$1-$2-$3-$4-$5",
+    );
+}
+
+function latestCodexTokenUsage(rolloutPath: string): RolloutTokenUsage | null {
+    let latest: RolloutTokenUsage | null = null;
+    let modelContextWindow: number | null = null;
+
+    for (const record of readRolloutRecords(rolloutPath)) {
+        if (record["type"] !== "event_msg") {
+            continue;
+        }
+        const payload = objectValue(record["payload"]);
+        if (!payload) {
+            continue;
+        }
+        if (payload["type"] === "task_started") {
+            modelContextWindow = numberValue(payload["model_context_window"]) ?? modelContextWindow;
+            continue;
+        }
+        if (payload["type"] !== "token_count") {
+            continue;
+        }
+        const info = objectValue(payload["info"]);
+        if (!info) {
+            continue;
+        }
+        modelContextWindow = numberValue(info["model_context_window"]) ?? modelContextWindow;
+        const last = usageBreakdown(info["last_token_usage"]);
+        if (!last) {
+            continue;
+        }
+        latest = {
+            last,
+            total: usageBreakdown(info["total_token_usage"]) ?? last,
+            modelContextWindow,
+        };
+    }
+
+    return latest;
+}
+
+function latestCompactionWindowState(rolloutPath: string): {
+    windowNumber: number | null;
+    firstWindowId: string | null;
+    windowId: string | null;
+} {
+    let windowNumber: number | null = null;
+    let firstWindowId: string | null = null;
+    let windowId: string | null = null;
+
+    for (const record of readRolloutRecords(rolloutPath)) {
+        if (record["type"] !== "compacted") {
+            continue;
+        }
+        const payload = objectValue(record["payload"]);
+        if (!payload) {
+            continue;
+        }
+        windowNumber = numberValue(payload["window_number"]) ?? windowNumber;
+        firstWindowId = stringValue(payload["first_window_id"]) ?? firstWindowId;
+        windowId = stringValue(payload["window_id"]) ?? windowId;
+    }
+
+    return {windowNumber, firstWindowId, windowId};
+}
+
+function collectRolloutUserMessages(rolloutPath: string): RolloutUserMessage[] {
+    let messages: RolloutUserMessage[] = [];
+
+    for (const record of readRolloutRecords(rolloutPath)) {
+        if (record["type"] === "compacted") {
+            const payload = objectValue(record["payload"]);
+            const replacementHistory = payload?.["replacement_history"];
+            if (Array.isArray(replacementHistory)) {
+                messages = replacementHistory
+                    .map(userMessageFromResponseItem)
+                    .filter((message): message is RolloutUserMessage => message !== null);
+            }
+            continue;
+        }
+
+        if (record["type"] !== "response_item") {
+            continue;
+        }
+        const message = userMessageFromResponseItem(record["payload"]);
+        if (message) {
+            messages.push(message);
+        }
+    }
+
+    return messages.filter(message => shouldKeepCompactedUserMessage(message.text));
+}
+
+function readRolloutRecords(rolloutPath: string): Record<string, unknown>[] {
+    let text: string;
+    try {
+        text = fs.readFileSync(rolloutPath, "utf8");
+    } catch {
+        return [];
+    }
+
+    const records: Record<string, unknown>[] = [];
+    for (const line of text.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("{")) {
+            continue;
+        }
+        try {
+            const record = JSON.parse(trimmed) as unknown;
+            if (record && typeof record === "object" && !Array.isArray(record)) {
+                records.push(record as Record<string, unknown>);
+            }
+        } catch {
+            continue;
+        }
+    }
+    return records;
+}
+
+function userMessageFromResponseItem(value: unknown): RolloutUserMessage | null {
+    const item = objectValue(value);
+    if (!item || item["type"] !== "message" || item["role"] !== "user") {
+        return null;
+    }
+
+    const text = contentText(item["content"]).trim();
+    if (text.length === 0 || !shouldKeepCompactedUserMessage(text)) {
+        return null;
+    }
+
+    return {
+        text,
+        internalChatMessageMetadataPassthrough: item["internal_chat_message_metadata_passthrough"] ?? null,
+    };
+}
+
+function contentText(value: unknown): string {
+    if (typeof value === "string") {
+        return value;
+    }
+    if (!Array.isArray(value)) {
+        return "";
+    }
+    return value.map(content => {
+        const record = objectValue(content);
+        if (!record) {
+            return "";
+        }
+        return stringValue(record["text"]) ?? "";
+    }).filter(part => part.length > 0).join("\n");
+}
+
+function shouldKeepCompactedUserMessage(text: string): boolean {
+    const trimmed = text.trim();
+    return trimmed !== "/compact" && !trimmed.startsWith(`${SUMMARY_PREFIX}\n`);
+}
+
+function selectRecentUserMessages(messages: RolloutUserMessage[]): RolloutUserMessage[] {
+    const selected: RolloutUserMessage[] = [];
+    let remaining = COMPACT_USER_MESSAGE_MAX_ESTIMATED_TOKENS;
+
+    for (const message of messages.slice().reverse()) {
+        if (remaining <= 0) {
+            break;
+        }
+        const tokens = estimateTokens(message.text);
+        if (tokens <= remaining) {
+            selected.push(message);
+            remaining -= tokens;
+            continue;
+        }
+        const maxChars = Math.max(1, remaining * 4);
+        selected.push({
+            text: message.text.slice(-maxChars),
+            internalChatMessageMetadataPassthrough: message.internalChatMessageMetadataPassthrough,
+        });
+        break;
+    }
+
+    return selected.reverse();
+}
+
+function userMessageToResponseItem(message: RolloutUserMessage): Record<string, unknown> {
+    const item: Record<string, unknown> = {
+        type: "message",
+        role: "user",
+        content: [{type: "input_text", text: message.text}],
+    };
+    if (message.internalChatMessageMetadataPassthrough !== null) {
+        item["internal_chat_message_metadata_passthrough"] = message.internalChatMessageMetadataPassthrough;
+    }
+    return item;
+}
+
+function estimateTokenUsageForReplacementHistory(items: Record<string, unknown>[]): TokenUsageBreakdown {
+    const text = items.map(item => contentText(item["content"])).join("\n\n");
+    const inputTokens = Math.max(1, estimateTokens(text));
+    return {
+        totalTokens: inputTokens,
+        inputTokens,
+        cachedInputTokens: 0,
+        outputTokens: 0,
+        reasoningOutputTokens: 0,
+    };
+}
+
+function estimateTokens(text: string): number {
+    return Math.ceil(text.length / 4);
+}
+
+function toSnakeTokenUsage(usage: TokenUsageBreakdown): Record<string, number> {
+    return {
+        input_tokens: usage.inputTokens,
+        cached_input_tokens: usage.cachedInputTokens,
+        output_tokens: usage.outputTokens,
+        reasoning_output_tokens: usage.reasoningOutputTokens,
+        total_tokens: usage.totalTokens,
+    };
+}
+
+function objectValue(value: unknown): Record<string, unknown> | null {
+    return value && typeof value === "object" && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : null;
 }
 
 function sanitizeMcpName(name: string): string {

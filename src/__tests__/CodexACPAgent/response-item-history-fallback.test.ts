@@ -121,6 +121,43 @@ describe("ResponseItemHistoryFallback", () => {
             { toolCallId: "call-read-ok", status: "completed" },
         ]);
     });
+
+    it("recovers custom apply_patch calls from rollout response items", () => {
+        const patch = [
+            "*** Begin Patch",
+            "*** Update File: README.md",
+            "@@",
+            "-old",
+            "+new",
+            "*** End Patch",
+        ].join("\n");
+        const updates = parseResponseItemHistoryFallback(jsonl([
+            customToolCall("call-patch", "apply_patch", patch),
+            customToolCallOutput("call-patch", "Success. Updated the following files:\nM README.md\n"),
+        ]), "terminal_output");
+
+        expect(updates).toEqual([
+            {
+                sessionUpdate: "tool_call",
+                toolCallId: "call-patch",
+                kind: "edit",
+                title: "Apply patch",
+                status: "in_progress",
+                rawInput: {
+                    name: "apply_patch",
+                    arguments: patch,
+                },
+            },
+            {
+                sessionUpdate: "tool_call_update",
+                toolCallId: "call-patch",
+                status: "completed",
+                rawOutput: {
+                    output: "Success. Updated the following files:\nM README.md\n",
+                },
+            },
+        ]);
+    });
 });
 
 function jsonl(records: unknown[]): string {
@@ -148,6 +185,29 @@ function functionCallOutput(callId: string, output: string): unknown {
         type: "response_item",
         payload: {
             type: "function_call_output",
+            call_id: callId,
+            output,
+        },
+    };
+}
+
+function customToolCall(callId: string, name: string, input: string): unknown {
+    return {
+        type: "response_item",
+        payload: {
+            type: "custom_tool_call",
+            name,
+            input,
+            call_id: callId,
+        },
+    };
+}
+
+function customToolCallOutput(callId: string, output: string): unknown {
+    return {
+        type: "response_item",
+        payload: {
+            type: "custom_tool_call_output",
             call_id: callId,
             output,
         },
