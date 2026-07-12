@@ -7,6 +7,7 @@ import {CodexCliRuntime, mcpServerConfigArgs} from "../../CodexCliRuntime";
 import {AgentMode} from "../../AgentMode";
 import {ModelId} from "../../ModelId";
 import type {ServerNotification} from "../../app-server";
+import {writePosixNodeCommand} from "../acp-test-utils";
 
 describe("CodexCliRuntime", () => {
     afterEach(() => {
@@ -31,18 +32,16 @@ describe("CodexCliRuntime", () => {
         ]);
     });
 
-    it("maps codex exec JSONL MCP tool calls into session notifications", async () => {
+    it.skipIf(process.platform === "win32")("maps codex exec JSONL MCP tool calls into session notifications", async () => {
         const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cli-runtime-test-"));
-        const fakeCodex = path.join(temp, "codex");
-        fs.writeFileSync(fakeCodex, `#!/bin/sh
-printf '%s\\n' '{"type":"thread.started","thread_id":"cli-thread-1"}'
-printf '%s\\n' '{"type":"turn.started"}'
-printf '%s\\n' '{"type":"item.started","item":{"id":"mcp-1","type":"mcp_tool_call","server":"codeg-delegate","tool":"delegate_to_agent","arguments":{"task":"check"},"status":"in_progress"}}'
-printf '%s\\n' '{"type":"item.completed","item":{"id":"mcp-1","type":"mcp_tool_call","server":"codeg-delegate","tool":"delegate_to_agent","arguments":{"task":"check"},"status":"completed","result":{"content":[{"type":"text","text":"done"}],"structuredContent":null,"_meta":null}}}'
-printf '%s\\n' '{"type":"item.completed","item":{"id":"msg-1","type":"agent_message","text":"done"}}'
-printf '%s\\n' '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}'
-        `, "utf8");
-        fs.chmodSync(fakeCodex, 0o755);
+        const fakeCodex = writePosixNodeCommand(temp, "codex", `
+console.log('{"type":"thread.started","thread_id":"cli-thread-1"}');
+console.log('{"type":"turn.started"}');
+console.log('{"type":"item.started","item":{"id":"mcp-1","type":"mcp_tool_call","server":"codeg-delegate","tool":"delegate_to_agent","arguments":{"task":"check"},"status":"in_progress"}}');
+console.log('{"type":"item.completed","item":{"id":"mcp-1","type":"mcp_tool_call","server":"codeg-delegate","tool":"delegate_to_agent","arguments":{"task":"check"},"status":"completed","result":{"content":[{"type":"text","text":"done"}],"structuredContent":null,"_meta":null}}}');
+console.log('{"type":"item.completed","item":{"id":"msg-1","type":"agent_message","text":"done"}}');
+console.log('{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}');
+        `);
         vi.stubEnv("CODEX_PATH", fakeCodex);
         vi.stubEnv("CODEX_HOME", path.join(temp, "codex-home"));
 
@@ -102,17 +101,15 @@ printf '%s\\n' '{"type":"turn.completed","usage":{"input_tokens":10,"cached_inpu
         fs.rmSync(temp, {recursive: true, force: true});
     });
 
-    it("places parent exec options before the resume subcommand", async () => {
+    it.skipIf(process.platform === "win32")("places parent exec options before the resume subcommand", async () => {
         const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cli-runtime-test-"));
-        const fakeCodex = path.join(temp, "codex");
         const argsLog = path.join(temp, "args.jsonl");
-        fs.writeFileSync(fakeCodex, `#!/usr/bin/env node
+        const fakeCodex = writePosixNodeCommand(temp, "codex", `
 const fs = require("node:fs");
 fs.appendFileSync(process.env.ARGS_LOG, JSON.stringify(process.argv.slice(2)) + "\\n");
 console.log(JSON.stringify({type: "thread.started", thread_id: "cli-thread-1"}));
 console.log(JSON.stringify({type: "turn.completed"}));
-        `, "utf8");
-        fs.chmodSync(fakeCodex, 0o755);
+        `);
         vi.stubEnv("CODEX_PATH", fakeCodex);
         vi.stubEnv("CODEX_HOME", path.join(temp, "codex-home"));
         vi.stubEnv("ARGS_LOG", argsLog);
@@ -167,17 +164,15 @@ console.log(JSON.stringify({type: "turn.completed"}));
         fs.rmSync(temp, {recursive: true, force: true});
     });
 
-    it("uses the configured CLI model even when Codeg passes a stale model id", async () => {
+    it.skipIf(process.platform === "win32")("uses the configured CLI model even when Codeg passes a stale model id", async () => {
         const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cli-runtime-test-"));
-        const fakeCodex = path.join(temp, "codex");
         const argsLog = path.join(temp, "args.jsonl");
-        fs.writeFileSync(fakeCodex, `#!/usr/bin/env node
+        const fakeCodex = writePosixNodeCommand(temp, "codex", `
 const fs = require("node:fs");
 fs.writeFileSync(process.env.ARGS_LOG, JSON.stringify(process.argv.slice(2)) + "\\n");
 console.log(JSON.stringify({type: "thread.started", thread_id: "cli-thread-1"}));
 console.log(JSON.stringify({type: "turn.completed"}));
-        `, "utf8");
-        fs.chmodSync(fakeCodex, 0o755);
+        `);
         vi.stubEnv("CODEX_PATH", fakeCodex);
         vi.stubEnv("CODEX_HOME", path.join(temp, "codex-home"));
         vi.stubEnv("CODEX_ACP_CLI_MODEL", "gpt-5.5");
@@ -208,9 +203,8 @@ console.log(JSON.stringify({type: "turn.completed"}));
         fs.rmSync(temp, {recursive: true, force: true});
     });
 
-    it("keeps the Codex rollout path when loading a persisted CLI session", async () => {
+    it.skipIf(process.platform === "win32")("keeps the Codex rollout path when loading a persisted CLI session", async () => {
         const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cli-runtime-test-"));
-        const fakeCodex = path.join(temp, "codex");
         const codexHome = path.join(temp, "codex-home");
         const rolloutDir = path.join(codexHome, "sessions", "2026", "07", "05");
         const rolloutPath = path.join(rolloutDir, "rollout-2026-07-05T10-00-00-cli-thread-1.jsonl");
@@ -247,11 +241,10 @@ console.log(JSON.stringify({type: "turn.completed"}));
                 },
             }),
         ].join("\n") + "\n", "utf8");
-        fs.writeFileSync(fakeCodex, `#!/bin/sh
-printf '%s\\n' '{"type":"thread.started","thread_id":"cli-thread-1"}'
-printf '%s\\n' '{"type":"turn.completed"}'
-`, "utf8");
-        fs.chmodSync(fakeCodex, 0o755);
+        const fakeCodex = writePosixNodeCommand(temp, "codex", `
+console.log('{"type":"thread.started","thread_id":"cli-thread-1"}');
+console.log('{"type":"turn.completed"}');
+`);
         vi.stubEnv("CODEX_PATH", fakeCodex);
         vi.stubEnv("CODEX_HOME", codexHome);
 
@@ -290,11 +283,10 @@ printf '%s\\n' '{"type":"turn.completed"}'
         fs.rmSync(temp, {recursive: true, force: true});
     });
 
-    it("emits a compaction notification when Codex CLI records a compacted rollout item", async () => {
+    it.skipIf(process.platform === "win32")("emits a compaction notification when Codex CLI records a compacted rollout item", async () => {
         const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cli-runtime-test-"));
-        const fakeCodex = path.join(temp, "codex");
         const codexHome = path.join(temp, "codex-home");
-        fs.writeFileSync(fakeCodex, `#!/usr/bin/env node
+        const fakeCodex = writePosixNodeCommand(temp, "codex", `
 const fs = require("node:fs");
 const path = require("node:path");
 const threadId = "cli-thread-compact";
@@ -308,8 +300,7 @@ fs.writeFileSync(path.join(rolloutDir, "rollout-2026-07-06T00-00-00-cli-thread-c
 console.log(JSON.stringify({type: "thread.started", thread_id: threadId}));
 console.log(JSON.stringify({type: "turn.started"}));
 console.log(JSON.stringify({type: "turn.completed"}));
-`, "utf8");
-        fs.chmodSync(fakeCodex, 0o755);
+`);
         vi.stubEnv("CODEX_PATH", fakeCodex);
         vi.stubEnv("CODEX_HOME", codexHome);
 
@@ -342,9 +333,8 @@ console.log(JSON.stringify({type: "turn.completed"}));
         fs.rmSync(temp, {recursive: true, force: true});
     });
 
-    it("installs a compacted rollout when codex exec treats /compact as a prompt", async () => {
+    it.skipIf(process.platform === "win32")("installs a compacted rollout when codex exec treats /compact as a prompt", async () => {
         const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cli-runtime-test-"));
-        const fakeCodex = path.join(temp, "codex");
         const codexHome = path.join(temp, "codex-home");
         const rolloutPath = path.join(
             codexHome,
@@ -354,7 +344,7 @@ console.log(JSON.stringify({type: "turn.completed"}));
             "06",
             "rollout-2026-07-06T00-00-00-cli-thread-synthetic-compact.jsonl",
         );
-        fs.writeFileSync(fakeCodex, `#!/usr/bin/env node
+        const fakeCodex = writePosixNodeCommand(temp, "codex", `
 const fs = require("node:fs");
 const path = require("node:path");
 const threadId = "cli-thread-synthetic-compact";
@@ -371,8 +361,7 @@ console.log(JSON.stringify({type: "thread.started", thread_id: threadId}));
 console.log(JSON.stringify({type: "turn.started"}));
 console.log(JSON.stringify({type: "item.completed", item: {id: "msg-compact", type: "agent_message", text: "当前进展：\\n- summary from codex exec"}}));
 console.log(JSON.stringify({type: "turn.completed", usage: {input_tokens: 121258, cached_input_tokens: 4480, output_tokens: 2066, reasoning_output_tokens: 0, total_tokens: 123324}}));
-`, "utf8");
-        fs.chmodSync(fakeCodex, 0o755);
+`);
         vi.stubEnv("CODEX_PATH", fakeCodex);
         vi.stubEnv("CODEX_HOME", codexHome);
 

@@ -33,6 +33,22 @@ export function normalizePathSeparators<T>(value: T): T {
     return value;
 }
 
+export function writePosixNodeCommand(directory: string, name: string, source: string): string {
+    const scriptName = `${name}.cjs`;
+    const scriptPath = path.join(directory, scriptName);
+    fs.writeFileSync(scriptPath, source, "utf8");
+
+    const commandPath = path.join(directory, name);
+    const escapedNode = process.execPath.replace(/'/g, `'\\''`);
+    fs.writeFileSync(
+        commandPath,
+        `#!/bin/sh\nexec '${escapedNode}' "$(dirname "$0")/${scriptName}" "$@"\n`,
+        "utf8",
+    );
+    fs.chmodSync(commandPath, 0o755);
+    return commandPath;
+}
+
 export interface SmartMockConfig {
     returnValues?: Map<string, (args: any[]) => any>;
 }

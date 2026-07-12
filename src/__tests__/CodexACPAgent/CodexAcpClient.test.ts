@@ -11,6 +11,7 @@ import {
     createTestFixture,
     createTestModel,
     createTestSessionState,
+    writePosixNodeCommand,
     type TestFixture
 } from "../acp-test-utils";
 import type {ServerNotification} from "../../app-server";
@@ -1496,11 +1497,10 @@ describe('ACP server test', { timeout: 40_000 }, () => {
         expect(mockFixture.getAcpConnectionDump([])).toContain("Context compacted");
     });
 
-    it('handles compact slash command inside Codex CLI runtime without app-server', async () => {
+    it.skipIf(process.platform === "win32")('handles compact slash command inside Codex CLI runtime without app-server', async () => {
         const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-acp-cli-compact-test-"));
-        const fakeCodex = path.join(temp, "codex");
         const codexHome = path.join(temp, "codex-home");
-        fs.writeFileSync(fakeCodex, `#!/usr/bin/env node
+        const fakeCodex = writePosixNodeCommand(temp, "codex", `
 const fs = require("node:fs");
 const path = require("node:path");
 const threadId = "cli-thread-compact";
@@ -1514,8 +1514,7 @@ fs.writeFileSync(path.join(rolloutDir, "rollout-2026-07-06T00-00-00-cli-thread-c
 console.log(JSON.stringify({type: "thread.started", thread_id: threadId}));
 console.log(JSON.stringify({type: "turn.started"}));
 console.log(JSON.stringify({type: "turn.completed"}));
-`, "utf8");
-        fs.chmodSync(fakeCodex, 0o755);
+`);
         vi.stubEnv("CODEX_ACP_USE_CLI", "1");
         vi.stubEnv("CODEX_ACP_CLI_MODEL", "gpt-5");
         vi.stubEnv("CODEX_PATH", fakeCodex);
