@@ -3,7 +3,12 @@ import type * as acp from "@agentclientprotocol/sdk";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createCodexMockTestFixture, createTestModel } from "../acp-test-utils";
+import {
+    createArrayDump,
+    createCodexMockTestFixture,
+    createTestModel,
+    normalizePathSeparators,
+} from "../acp-test-utils";
 import type { Model, Thread } from "../../app-server/v2";
 
 describe("CodexACPAgent - loadSession", () => {
@@ -539,7 +544,8 @@ describe("CodexACPAgent - loadSession", () => {
                 mcpServers: [],
             });
 
-            await expect(fixture.getAcpConnectionDump([])).toMatchFileSnapshot(
+            const normalizedEvents = normalizePathSeparators(fixture.getAcpConnectionEvents([]));
+            await expect(createArrayDump(normalizedEvents, [])).toMatchFileSnapshot(
                 "data/load-session-response-item-history-fallback.json",
             );
         } finally {

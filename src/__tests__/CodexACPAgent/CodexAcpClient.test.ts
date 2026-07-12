@@ -388,7 +388,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
 
         expect(session.additionalDirectories).toEqual(["/workspace/extra"]);
         expect(extraRootsSetSpy).toHaveBeenCalledWith({
-            extraRoots: ["/workspace/extra/.agents/skills"],
+            extraRoots: [path.join("/workspace/extra", ".agents", "skills")],
         });
         expect(listSkillsSpy).toHaveBeenCalledWith({
             cwds: ["/workspace", "/workspace/extra"],
@@ -783,7 +783,7 @@ describe('ACP server test', { timeout: 40_000 }, () => {
         });
 
         expect(extraRootsSetSpy).toHaveBeenCalledWith({
-            extraRoots: ["/workspace/extra/.agents/skills"],
+            extraRoots: [path.join("/workspace/extra", ".agents", "skills")],
         });
         expect(listSkillsSpy).toHaveBeenCalledWith({
             cwds: ["/workspace", "/workspace/extra"],

@@ -16,6 +16,23 @@ import type {Model, ReasoningEffortOption} from "../app-server/v2";
 
 export type MethodCallEvent = { method: string; args: any[] };
 
+export function normalizePathSeparators<T>(value: T): T {
+    if (typeof value === "string") {
+        return value.replace(/\\/g, "/") as unknown as T;
+    }
+    if (Array.isArray(value)) {
+        return value.map(normalizePathSeparators) as unknown as T;
+    }
+    if (value && typeof value === "object") {
+        const normalized: Record<string, unknown> = {};
+        for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+            normalized[key] = normalizePathSeparators(nested);
+        }
+        return normalized as unknown as T;
+    }
+    return value;
+}
+
 export interface SmartMockConfig {
     returnValues?: Map<string, (args: any[]) => any>;
 }

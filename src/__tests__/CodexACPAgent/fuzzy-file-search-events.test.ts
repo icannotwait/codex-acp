@@ -1,25 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { SessionState } from "../../CodexAcpServer";
 import type { ServerNotification } from "../../app-server";
-import { createCodexMockTestFixture, createTestSessionState, setupPromptAndSendNotifications, type CodexMockTestFixture } from "../acp-test-utils";
+import { createCodexMockTestFixture, createTestSessionState, normalizePathSeparators, setupPromptAndSendNotifications, type CodexMockTestFixture } from "../acp-test-utils";
 import { AgentMode } from "../../AgentMode";
-
-function normalizePathSeparators<T>(value: T): T {
-    if (typeof value === "string") {
-        return value.replace(/\\/g, "/") as unknown as T;
-    }
-    if (Array.isArray(value)) {
-        return value.map(normalizePathSeparators) as unknown as T;
-    }
-    if (value && typeof value === "object") {
-        const out: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-            out[k] = normalizePathSeparators(v);
-        }
-        return out as unknown as T;
-    }
-    return value;
-}
 
 describe("CodexEventHandler - fuzzy file search events", () => {
     let mockFixture: CodexMockTestFixture;
