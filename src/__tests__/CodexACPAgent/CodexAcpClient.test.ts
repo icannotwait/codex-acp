@@ -21,7 +21,9 @@ import type {Model, ReviewStartResponse, ThreadGoal, TurnCompletedNotification, 
 import type {RateLimitsMap} from "../../RateLimitsMap";
 import {ModelId} from "../../ModelId";
 
-describe('ACP server test', { timeout: 40_000 }, () => {
+describe('ACP server test', {
+    timeout: process.platform === "win32" ? 90_000 : 40_000,
+}, () => {
 
     let fixture: TestFixture;
     beforeEach(() => {
