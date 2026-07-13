@@ -16,6 +16,7 @@ import type {
     TurnCompletedNotification,
 } from "./app-server/v2";
 import {AgentMode} from "./AgentMode";
+import {resolveCodexCommandLaunch} from "./CodexJsonRpcConnection";
 import {ModelId} from "./ModelId";
 
 type NotificationHandler = (event: ServerNotification) => void | Promise<void>;
@@ -73,6 +74,8 @@ type RolloutUserMessage = {
 const CLI_RUNTIME_ENV_VAR = "CODEX_ACP_USE_CLI";
 const DEFAULT_CLI_MODEL = "gpt-5";
 const CLI_SESSION_MAP_FILENAME = "codeg-codex-acp-cli-sessions.json";
+export const LEGACY_CLI_SESSION_MESSAGE =
+    "This Codex session was created by the legacy CLI runtime and cannot be resumed. Create a new session.";
 const SUMMARY_PREFIX = "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
 const COMPACT_USER_MESSAGE_MAX_ESTIMATED_TOKENS = 20_000;
 
@@ -215,9 +218,11 @@ export class CodexCliRuntime {
             argv: ["codex", ...redactArgs(args)],
         });
 
-        const child = spawn(resolveCodexPath(), args, {
+        const launch = resolveCodexCommandLaunch(resolveCodexPath(), args);
+        const child = spawn(launch.command, launch.args, {
             cwd: session.cwd,
             env: process.env,
+            shell: launch.shell,
             stdio: ["ignore", "pipe", "pipe"],
         });
         session.activeChild = child;
@@ -765,6 +770,10 @@ function readPersistedCliSessions(): Record<string, PersistedCliSession> {
 
 function readPersistedCliSession(sessionId: string): PersistedCliSession | null {
     return readPersistedCliSessions()[sessionId] ?? null;
+}
+
+export function isPersistedCliRuntimeSession(sessionId: string): boolean {
+    return readPersistedCliSession(sessionId) !== null;
 }
 
 function persistCliSession(session: CliSession): void {

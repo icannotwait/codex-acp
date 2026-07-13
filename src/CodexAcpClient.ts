@@ -43,6 +43,8 @@ import type {AuthenticationStatusResponse} from "./AcpExtensions";
 import {
     CODEX_CLI_RUNTIME_ENV_VAR,
     CodexCliRuntime,
+    isPersistedCliRuntimeSession,
+    LEGACY_CLI_SESSION_MESSAGE,
     shouldUseCodexCliRuntime,
 } from "./CodexCliRuntime";
 
@@ -350,6 +352,7 @@ export class CodexAcpClient {
     }
 
     async resumeSession(request: acp.ResumeSessionRequest, onSubscribed?: () => void): Promise<SessionMetadata> {
+        this.rejectLegacyCliRuntimeSession(request.sessionId);
         const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);
         if (this.cliRuntime) {
             this.cliRuntime.resumeSession(request, additionalDirectories);
@@ -386,6 +389,7 @@ export class CodexAcpClient {
     }
 
     async loadSession(request: acp.LoadSessionRequest, onSubscribed?: () => void): Promise<SessionMetadataWithThread> {
+        this.rejectLegacyCliRuntimeSession(request.sessionId);
         const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);
         if (this.cliRuntime) {
             const session = this.cliRuntime.resumeSession({
@@ -465,6 +469,12 @@ export class CodexAcpClient {
             currentServiceTier: response.serviceTier as ServiceTier ?? null,
             additionalDirectories,
         };
+    }
+
+    private rejectLegacyCliRuntimeSession(sessionId: string): void {
+        if (!this.cliRuntime && isPersistedCliRuntimeSession(sessionId)) {
+            throw new RequestError(-32002, LEGACY_CLI_SESSION_MESSAGE);
+        }
     }
 
     async closeSession(sessionId: string): Promise<void> {
