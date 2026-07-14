@@ -1523,7 +1523,21 @@ console.log(JSON.stringify({type: "turn.completed"}));
         vi.stubEnv("CODEX_HOME", codexHome);
 
         const mockFixture = createCodexMockTestFixture();
-        const compactStartSpy = vi.spyOn(mockFixture.getCodexAppServerClient(), "threadCompactStart")
+        const appServer = mockFixture.getCodexAppServerClient();
+        // CLI mode still resolves the model catalog via app-server control plane.
+        vi.spyOn(appServer, "listModels").mockResolvedValue({
+            data: [createTestModel({id: "gpt-5", isDefault: true})],
+            nextCursor: null,
+        });
+        vi.spyOn(appServer, "configRead").mockResolvedValue({
+            config: {
+                model: "gpt-5",
+                model_reasoning_effort: "medium",
+            },
+            origins: {},
+            layers: [],
+        } as any);
+        const compactStartSpy = vi.spyOn(appServer, "threadCompactStart")
             .mockRejectedValue(new Error("Not initialized"));
 
         await mockFixture.getCodexAcpAgent().initialize({protocolVersion: 1});
