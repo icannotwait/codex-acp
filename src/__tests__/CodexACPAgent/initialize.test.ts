@@ -23,6 +23,7 @@ describe('CodexACPAgent - initialize', () => {
 
     afterEach(() => {
         vi.clearAllMocks();
+        vi.unstubAllEnvs();
     });
 
     it('should return protocol version and agent capabilities', async () => {
@@ -123,4 +124,18 @@ describe('CodexACPAgent - initialize', () => {
         expect(methodIds).not.toContain("chat-gpt");
         expect(methodIds).toEqual(expect.arrayContaining(["api-key"]));
     });
+
+    it("initializes app-server when CLI runtime is enabled", async () => {
+        vi.stubEnv("CODEX_ACP_USE_CLI", "1")
+        const mocks = createMockConnections()
+        const appServer = new CodexAppServerClient(mocks.mockCodexConnection)
+        const client = new CodexAcpClient(appServer)
+
+        await client.initialize({protocolVersion: acp.PROTOCOL_VERSION})
+
+        expect(mocks.mockCodexConnection.sendRequest).toHaveBeenCalledWith(
+            "initialize",
+            expect.objectContaining({capabilities: null})
+        )
+    })
 });

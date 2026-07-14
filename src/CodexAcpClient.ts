@@ -41,7 +41,6 @@ import type {
 import packageJson from "../package.json";
 import type {AuthenticationStatusResponse} from "./AcpExtensions";
 import {
-    CODEX_CLI_RUNTIME_ENV_VAR,
     CodexCliRuntime,
     isPersistedCliRuntimeSession,
     LEGACY_CLI_SESSION_MESSAGE,
@@ -92,10 +91,6 @@ export class CodexAcpClient {
     };
 
     async initialize(request: acp.InitializeRequest): Promise<void> {
-        if (this.cliRuntime) {
-            logger.log(`${CODEX_CLI_RUNTIME_ENV_VAR} enabled: skipping Codex app-server initialize`);
-            return;
-        }
         await this.codexClient.initialize({
             capabilities: null,
             clientInfo: {
@@ -357,10 +352,14 @@ export class CodexAcpClient {
         if (this.cliRuntime) {
             this.cliRuntime.resumeSession(request, additionalDirectories);
             onSubscribed?.();
-            const models = this.cliRuntime.availableModels();
+            const models = await this.fetchAvailableModels();
+            const currentModelId = (await this.resolveCliSessionModel(
+                models,
+                request._meta?.["model"] as string | null ?? null,
+            )).toString();
             return {
                 sessionId: request.sessionId,
-                currentModelId: this.createModelId(models, request._meta?.["model"] as string | null ?? models[0]!.id, null).toString(),
+                currentModelId,
                 models,
                 modelProvider: this.getModelProvider(),
                 currentServiceTier: null,
@@ -397,10 +396,14 @@ export class CodexAcpClient {
                 prompt: [],
             } as acp.ResumeSessionRequest, additionalDirectories);
             onSubscribed?.();
-            const models = this.cliRuntime.availableModels();
+            const models = await this.fetchAvailableModels();
+            const currentModelId = (await this.resolveCliSessionModel(
+                models,
+                request._meta?.["model"] as string | null ?? null,
+            )).toString();
             return {
                 sessionId: request.sessionId,
-                currentModelId: this.createModelId(models, models[0]!.id, null).toString(),
+                currentModelId,
                 models,
                 modelProvider: this.getModelProvider(),
                 currentServiceTier: null,
@@ -438,10 +441,14 @@ export class CodexAcpClient {
         const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);
         if (this.cliRuntime) {
             const session = this.cliRuntime.createSession(request, additionalDirectories);
-            const models = this.cliRuntime.availableModels();
+            const models = await this.fetchAvailableModels();
+            const currentModelId = (await this.resolveCliSessionModel(
+                models,
+                request._meta?.["model"] as string | null ?? null,
+            )).toString();
             return {
                 sessionId: session.sessionId,
-                currentModelId: this.createModelId(models, models[0]!.id, null).toString(),
+                currentModelId,
                 models,
                 modelProvider: this.getModelProvider(),
                 currentServiceTier: null,
@@ -947,9 +954,6 @@ export class CodexAcpClient {
     }
 
     async fetchAvailableModels(): Promise<Model[]> {
-        if (this.cliRuntime) {
-            return this.cliRuntime.availableModels();
-        }
         const models: Model[] = [];
         let cursor: string | null = null;
 
@@ -960,6 +964,24 @@ export class CodexAcpClient {
         } while (cursor);
 
         return models;
+    }
+
+    private async resolveCliSessionModel(
+        models: Model[],
+        requestedModelId: string | null,
+    ): Promise<ModelId> {
+        if (models.length === 0) {
+            throw new Error("Codex did not return any models");
+        }
+        if (requestedModelId) {
+            return this.createModelId(models, requestedModelId, null);
+        }
+        const response = await this.codexClient.configRead({includeLayers: false});
+        return this.createModelId(
+            models,
+            response?.config?.model ?? null,
+            response?.config?.model_reasoning_effort ?? null,
+        );
     }
 
     private async runSessionListDiagnostics(): Promise<Record<string, unknown>> {
