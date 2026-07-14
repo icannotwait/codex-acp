@@ -985,12 +985,19 @@ export class CodexAcpClient {
             try {
                 const parsed = ModelId.fromString(persisted);
                 const model = models.find(item => item.id === parsed.model);
-                const effortSupported = model?.supportedReasoningEfforts.some(
-                    item => item.reasoningEffort === parsed.effort,
-                );
-                if (model && effortSupported) {
+                if (!model) {
+                    // Custom provider model not in the app-server catalog — keep
+                    // the persisted id (same spirit as createModelId) instead of
+                    // falling through to config and substituting a catalog model.
                     return parsed;
                 }
+                const effortSupported = model.supportedReasoningEfforts.some(
+                    item => item.reasoningEffort === parsed.effort,
+                );
+                if (effortSupported) {
+                    return parsed;
+                }
+                // Catalogued model with an unsupported effort falls through.
             } catch {
                 // Legacy or corrupt values fall through to config/default resolution.
             }

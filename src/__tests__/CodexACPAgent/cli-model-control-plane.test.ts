@@ -173,7 +173,7 @@ describe("CLI model control plane", () => {
         fs.rmSync(temp, {recursive: true, force: true})
     })
 
-    it("falls back to config defaults when persisted model is no longer available", async () => {
+    it("preserves custom provider model ids on resume when absent from catalog", async () => {
         const temp = fs.mkdtempSync(path.join(os.tmpdir(), "cli-model-control-plane-"))
         const codexHome = path.join(temp, "codex-home")
         fs.mkdirSync(codexHome, {recursive: true})
@@ -186,7 +186,50 @@ describe("CLI model control plane", () => {
                 cwd: temp,
                 lastPrompt: null,
                 updatedAt: 1,
-                selectedModelId: "removed-model[xhigh]",
+                selectedModelId: "MiniMax-M3[high]",
+            },
+        }))
+
+        const catalog = createTestModel({id: "gpt-5.2", isDefault: true})
+        vi.spyOn(appServer, "listModels").mockResolvedValue({
+            data: [catalog],
+            nextCursor: null,
+        })
+        const configRead = vi.spyOn(appServer, "configRead").mockResolvedValue({
+            config: {
+                model: "gpt-5.2",
+                model_reasoning_effort: "medium",
+            },
+            origins: {},
+            layers: [],
+        } as any)
+
+        const resumed = await client.resumeSession({
+            sessionId: "codeg-session",
+            cwd: temp,
+            mcpServers: [],
+        })
+        expect(resumed.currentModelId).toBe("MiniMax-M3[high]")
+        // Must not fall through to configRead when a valid custom id is persisted.
+        expect(configRead).not.toHaveBeenCalled()
+
+        fs.rmSync(temp, {recursive: true, force: true})
+    })
+
+    it("falls back to config defaults when catalogued model has unsupported effort", async () => {
+        const temp = fs.mkdtempSync(path.join(os.tmpdir(), "cli-model-control-plane-"))
+        const codexHome = path.join(temp, "codex-home")
+        fs.mkdirSync(codexHome, {recursive: true})
+        vi.stubEnv("CODEX_HOME", codexHome)
+        fs.writeFileSync(path.join(codexHome, "codeg-codex-acp-cli-sessions.json"), JSON.stringify({
+            "codeg-session": {
+                sessionId: "codeg-session",
+                cliThreadId: "cli-thread",
+                cliRolloutPath: null,
+                cwd: temp,
+                lastPrompt: null,
+                updatedAt: 1,
+                selectedModelId: "gpt-5.2[xhigh]",
             },
         }))
 
