@@ -354,6 +354,7 @@ export class CodexAcpClient {
             onSubscribed?.();
             const models = await this.fetchAvailableModels();
             const currentModelId = (await this.resolveCliSessionModel(
+                request.sessionId,
                 models,
                 request._meta?.["model"] as string | null ?? null,
             )).toString();
@@ -398,6 +399,7 @@ export class CodexAcpClient {
             onSubscribed?.();
             const models = await this.fetchAvailableModels();
             const currentModelId = (await this.resolveCliSessionModel(
+                request.sessionId,
                 models,
                 request._meta?.["model"] as string | null ?? null,
             )).toString();
@@ -443,6 +445,7 @@ export class CodexAcpClient {
             const session = this.cliRuntime.createSession(request, additionalDirectories);
             const models = await this.fetchAvailableModels();
             const currentModelId = (await this.resolveCliSessionModel(
+                session.sessionId,
                 models,
                 request._meta?.["model"] as string | null ?? null,
             )).toString();
@@ -967,6 +970,7 @@ export class CodexAcpClient {
     }
 
     private async resolveCliSessionModel(
+        sessionId: string,
         models: Model[],
         requestedModelId: string | null,
     ): Promise<ModelId> {
@@ -975,6 +979,21 @@ export class CodexAcpClient {
         }
         if (requestedModelId) {
             return this.createModelId(models, requestedModelId, null);
+        }
+        const persisted = this.cliRuntime?.selectedModelId(sessionId);
+        if (persisted) {
+            try {
+                const parsed = ModelId.fromString(persisted);
+                const model = models.find(item => item.id === parsed.model);
+                const effortSupported = model?.supportedReasoningEfforts.some(
+                    item => item.reasoningEffort === parsed.effort,
+                );
+                if (model && effortSupported) {
+                    return parsed;
+                }
+            } catch {
+                // Legacy or corrupt values fall through to config/default resolution.
+            }
         }
         const response = await this.codexClient.configRead({includeLayers: false});
         return this.createModelId(

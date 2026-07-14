@@ -32,6 +32,7 @@ interface CliSession {
     lastPrompt: string | null;
     updatedAt: number;
     lastKnownCompactionCount: number;
+    selectedModelId: string | null;
 }
 
 interface PersistedCliSession {
@@ -41,6 +42,7 @@ interface PersistedCliSession {
     cwd: string;
     lastPrompt: string | null;
     updatedAt: number;
+    selectedModelId?: string | null;
 }
 
 interface CliRunState {
@@ -100,6 +102,7 @@ export class CodexCliRuntime {
             lastPrompt: null,
             updatedAt: Date.now(),
             lastKnownCompactionCount: 0,
+            selectedModelId: null,
         };
         this.sessions.set(sessionId, session);
         return session;
@@ -120,6 +123,7 @@ export class CodexCliRuntime {
             lastPrompt: persisted?.lastPrompt ?? null,
             updatedAt: persisted?.updatedAt ?? Date.now(),
             lastKnownCompactionCount: cliRolloutPath ? countCodexCompactions(cliRolloutPath) : 0,
+            selectedModelId: persisted?.selectedModelId ?? null,
         };
         this.sessions.set(request.sessionId, session);
         return session;
@@ -127,6 +131,10 @@ export class CodexCliRuntime {
 
     getSession(sessionId: string): CliSession | undefined {
         return this.sessions.get(sessionId);
+    }
+
+    selectedModelId(sessionId: string): string | null {
+        return this.sessions.get(sessionId)?.selectedModelId ?? null;
     }
 
     closeSession(sessionId: string): void {
@@ -177,6 +185,10 @@ export class CodexCliRuntime {
         const session = this.sessions.get(params.request.sessionId);
         if (!session) {
             throw new Error(`Unknown Codex CLI session ${params.request.sessionId}`);
+        }
+        session.selectedModelId = params.modelId.toString();
+        if (session.cliThreadId) {
+            this.refreshAndPersistSession(session);
         }
         session.cwd = params.cwd;
         session.additionalDirectories = params.additionalDirectories;
@@ -589,6 +601,15 @@ export class CodexCliRuntime {
     }
 }
 
+export function codexExecModelArgs(modelId: ModelId): string[] {
+    return [
+        "-m",
+        runtimeCliModel(modelId.model),
+        "-c",
+        `model_reasoning_effort=${tomlString(modelId.effort)}`,
+    ];
+}
+
 function buildCodexExecArgs(params: {
     session: CliSession;
     prompt: string;
@@ -601,7 +622,7 @@ function buildCodexExecArgs(params: {
     const isResume = params.session.cliThreadId !== null;
     args.push("exec");
     args.push("--json", "--skip-git-repo-check", "-C", params.session.cwd);
-    args.push("-m", runtimeCliModel(params.modelId.model));
+    args.push(...codexExecModelArgs(params.modelId));
     args.push("-s", codexSandboxArg(params.agentMode));
     if (params.disableSummary) {
         args.push("-c", "model_reasoning_summary=\"none\"");
@@ -760,6 +781,7 @@ function readPersistedCliSessions(): Record<string, PersistedCliSession> {
                 cwd: record ? stringValue(record["cwd"]) ?? process.cwd() : process.cwd(),
                 lastPrompt: record ? stringValue(record["lastPrompt"]) : null,
                 updatedAt: record ? numberValue(record["updatedAt"]) ?? Date.now() : Date.now(),
+                selectedModelId: record ? stringValue(record["selectedModelId"]) : null,
             };
         }
         return sessions;
@@ -789,6 +811,7 @@ function persistCliSession(session: CliSession): void {
         cwd: session.cwd,
         lastPrompt: session.lastPrompt,
         updatedAt: session.updatedAt,
+        selectedModelId: session.selectedModelId,
     };
     try {
         fs.mkdirSync(codexHome(), {recursive: true});

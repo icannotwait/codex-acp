@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type {McpServerStdio} from "@agentclientprotocol/sdk";
-import {CodexCliRuntime, mcpServerConfigArgs} from "../../CodexCliRuntime";
+import {CodexCliRuntime, codexExecModelArgs, mcpServerConfigArgs} from "../../CodexCliRuntime";
 import {AgentMode} from "../../AgentMode";
 import {ModelId} from "../../ModelId";
 import type {ServerNotification} from "../../app-server";
@@ -12,6 +12,82 @@ import {writePosixNodeCommand} from "../acp-test-utils";
 describe("CodexCliRuntime", () => {
     afterEach(() => {
         vi.unstubAllEnvs();
+    });
+
+    it("forwards the selected model and reasoning effort", () => {
+        expect(codexExecModelArgs(ModelId.create("gpt-5.4", "high"))).toEqual([
+            "-m",
+            "gpt-5.4",
+            "-c",
+            'model_reasoning_effort="high"',
+        ]);
+    });
+
+    it("keeps CODEX_ACP_CLI_MODEL as the execution model override", () => {
+        vi.stubEnv("CODEX_ACP_CLI_MODEL", "gateway-alias");
+        expect(codexExecModelArgs(ModelId.create("gpt-5.4", "high"))).toEqual([
+            "-m",
+            "gateway-alias",
+            "-c",
+            'model_reasoning_effort="high"',
+        ]);
+    });
+
+    it("restores a persisted selected model id", () => {
+        const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cli-runtime-test-"));
+        const codexHome = path.join(temp, "codex-home");
+        fs.mkdirSync(codexHome, {recursive: true});
+        const sessionMapPath = path.join(codexHome, "codeg-codex-acp-cli-sessions.json");
+        vi.stubEnv("CODEX_HOME", codexHome);
+        fs.writeFileSync(sessionMapPath, JSON.stringify({
+            "codeg-session": {
+                sessionId: "codeg-session",
+                cliThreadId: "cli-thread",
+                cliRolloutPath: null,
+                cwd: temp,
+                lastPrompt: null,
+                updatedAt: 1,
+                selectedModelId: "gpt-5.4[high]",
+            },
+        }));
+        const runtime = new CodexCliRuntime();
+        runtime.resumeSession({
+            sessionId: "codeg-session",
+            cwd: temp,
+            mcpServers: [],
+        }, []);
+
+        expect(runtime.selectedModelId("codeg-session")).toBe("gpt-5.4[high]");
+
+        fs.rmSync(temp, {recursive: true, force: true});
+    });
+
+    it("returns null for legacy session records without selectedModelId", () => {
+        const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cli-runtime-test-"));
+        const codexHome = path.join(temp, "codex-home");
+        fs.mkdirSync(codexHome, {recursive: true});
+        const sessionMapPath = path.join(codexHome, "codeg-codex-acp-cli-sessions.json");
+        vi.stubEnv("CODEX_HOME", codexHome);
+        fs.writeFileSync(sessionMapPath, JSON.stringify({
+            "legacy-session": {
+                sessionId: "legacy-session",
+                cliThreadId: "cli-thread",
+                cliRolloutPath: null,
+                cwd: temp,
+                lastPrompt: null,
+                updatedAt: 1,
+            },
+        }));
+        const runtime = new CodexCliRuntime();
+        runtime.resumeSession({
+            sessionId: "legacy-session",
+            cwd: temp,
+            mcpServers: [],
+        }, []);
+
+        expect(runtime.selectedModelId("legacy-session")).toBeNull();
+
+        fs.rmSync(temp, {recursive: true, force: true});
     });
 
     it("converts ACP MCP servers to Codex CLI config overrides", () => {
@@ -152,6 +228,8 @@ console.log(JSON.stringify({type: "turn.completed"}));
             temp,
             "-m",
             "gpt-5",
+            "-c",
+            'model_reasoning_effort="medium"',
             "-s",
             "workspace-write",
             "--add-dir",
