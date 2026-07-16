@@ -586,8 +586,10 @@ export class CodexAcpClient {
             }])),
         };
         const configWithWorkspaceRoots = mergeSandboxWorkspaceWriteRoots(mergedConfig, additionalDirectories);
+        // Apply route override before every early return so MCP-server merging cannot drop it.
+        const configWithRoute = mergeMultiAgentRouteConfig(configWithWorkspaceRoots);
         if (mcpServers.length === 0) {
-            return configWithWorkspaceRoots;
+            return configWithRoute;
         }
 
         const requestedServers = mcpServers.map(mcp => ({
@@ -601,11 +603,11 @@ export class CodexAcpClient {
             serversToConfigure = requestedServers.filter(mcp => !existingNames.has(mcp.name));
         }
         if (serversToConfigure.length === 0) {
-            return configWithWorkspaceRoots;
+            return configWithRoute;
         }
 
         return {
-            ...configWithWorkspaceRoots,
+            ...configWithRoute,
             "mcp_servers": Object.fromEntries(serversToConfigure.map(mcp => [mcp.name, this.createMcpSeverConfig(mcp.server)])),
         };
     }
@@ -1218,6 +1220,25 @@ function arraysEqual(left: string[], right: string[]): boolean {
 
 function isJsonObject(value: JsonValue | undefined): value is JsonObject {
     return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Translate the connection-scoped Codeg delegation route into App Server
+ * `thread/start` / resume config. Only exact `CODEX_ACP_MULTI_AGENT=0` forces
+ * `features.multi_agent=false`. Native env returns the original config object.
+ */
+export function mergeMultiAgentRouteConfig(
+    config: JsonObject,
+    env: NodeJS.ProcessEnv = process.env
+): JsonObject {
+    if (env["CODEX_ACP_MULTI_AGENT"] !== "0") {
+        return config;
+    }
+    const prior = isJsonObject(config["features"]) ? config["features"] : {};
+    return {
+        ...config,
+        features: {...prior, multi_agent: false},
+    };
 }
 
 function gatewayApiTypeFromConfig(gatewayConfig: GatewayConfig): acp.LlmProtocol {

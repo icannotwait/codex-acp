@@ -20,6 +20,48 @@ import {AgentMode} from "../../AgentMode";
 import type {Model, ReviewStartResponse, ThreadGoal, TurnCompletedNotification, TurnStartParams} from "../../app-server/v2";
 import type {RateLimitsMap} from "../../RateLimitsMap";
 import {ModelId} from "../../ModelId";
+import {mergeMultiAgentRouteConfig} from "../../CodexAcpClient";
+
+describe('mergeMultiAgentRouteConfig', () => {
+    afterEach(() => {
+        vi.unstubAllEnvs();
+    });
+
+    it("deep-merges multi-agent false without dropping unrelated App Server features", () => {
+        const config = {
+            model: "gpt-5.4",
+            features: {shell_snapshot: true, multi_agent: true},
+        };
+        expect(
+            mergeMultiAgentRouteConfig(config, {CODEX_ACP_MULTI_AGENT: "0"})
+        ).toEqual({
+            model: "gpt-5.4",
+            features: {shell_snapshot: true, multi_agent: false},
+        });
+        expect(config.features.multi_agent).toBe(true);
+    });
+
+    it("returns the original config unchanged when the route env is not exact 0", () => {
+        const config = {
+            model: "gpt-5.4",
+            features: {shell_snapshot: true, multi_agent: true},
+        };
+        expect(mergeMultiAgentRouteConfig(config, {})).toBe(config);
+        expect(mergeMultiAgentRouteConfig(config, {CODEX_ACP_MULTI_AGENT: ""})).toBe(config);
+        expect(mergeMultiAgentRouteConfig(config, {CODEX_ACP_MULTI_AGENT: "1"})).toBe(config);
+        expect(mergeMultiAgentRouteConfig(config, {CODEX_ACP_MULTI_AGENT: "true"})).toBe(config);
+    });
+
+    it("creates features when missing and never emits multi_agent true", () => {
+        const config = {model: "gpt-5.4"};
+        const merged = mergeMultiAgentRouteConfig(config, {CODEX_ACP_MULTI_AGENT: "0"});
+        expect(merged).toEqual({
+            model: "gpt-5.4",
+            features: {multi_agent: false},
+        });
+        expect(JSON.stringify(merged)).not.toContain('"multi_agent":true');
+    });
+});
 
 describe('ACP server test', {
     timeout: process.platform === "win32" ? 90_000 : 40_000,

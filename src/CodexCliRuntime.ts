@@ -632,6 +632,20 @@ export function codexExecModelArgs(modelId: ModelId): string[] {
     ];
 }
 
+/**
+ * Translate the connection-scoped Codeg delegation route into a one-shot
+ * `codex exec -c` override. Only the exact managed-Codeg value `"0"` forces
+ * `features.multi_agent=false`. Absent/empty/other values leave native config alone
+ * and never emit a true override.
+ */
+export function codexMultiAgentConfigArgs(
+    env: NodeJS.ProcessEnv = process.env
+): string[] {
+    return env["CODEX_ACP_MULTI_AGENT"] === "0"
+        ? ["-c", "features.multi_agent=false"]
+        : [];
+}
+
 function buildCodexExecArgs(params: {
     session: CliSession;
     modelId: ModelId;
@@ -655,6 +669,8 @@ function buildCodexExecArgs(params: {
         args.push("--add-dir", root);
     }
     args.push(...mcpServerConfigArgs(params.session.mcpServers));
+    // Route override must land before resume/subcommand so codex sees it as config.
+    args.push(...codexMultiAgentConfigArgs());
     if (isResume) {
         args.push("resume", params.session.cliThreadId!);
     }

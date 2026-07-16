@@ -9,6 +9,7 @@ import type {McpServerStdio} from "@agentclientprotocol/sdk";
 import {
     CodexCliRuntime,
     codexExecModelArgs,
+    codexMultiAgentConfigArgs,
     mcpServerConfigArgs,
     writePromptToStdin,
 } from "../../CodexCliRuntime";
@@ -17,9 +18,108 @@ import {ModelId} from "../../ModelId";
 import type {ServerNotification} from "../../app-server";
 import {writeCrossPlatformNodeCommand, writePosixNodeCommand} from "../acp-test-utils";
 
+type CliCapture = {argv: string[]; stdin: string};
+
+async function runTwoTurnCliCapture(): Promise<CliCapture[]> {
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cli-runtime-multi-agent-"));
+    try {
+        const captureLog = path.join(temp, "capture.jsonl");
+        const fakeCodex = writeCrossPlatformNodeCommand(temp, "codex", `
+const fs = require("node:fs");
+const chunks = [];
+process.stdin.on("data", chunk => chunks.push(Buffer.from(chunk)));
+process.stdin.on("end", () => {
+  const stdin = Buffer.concat(chunks).toString("utf8");
+  fs.appendFileSync(process.env.CAPTURE_LOG, JSON.stringify({
+    argv: process.argv.slice(2),
+    stdin,
+  }) + "\\n");
+  console.log(JSON.stringify({type: "thread.started", thread_id: "cli-thread-multi-agent"}));
+  console.log(JSON.stringify({type: "turn.completed"}));
+});
+        `);
+        vi.stubEnv("CODEX_PATH", fakeCodex);
+        vi.stubEnv("CODEX_HOME", path.join(temp, "codex-home"));
+        vi.stubEnv("CAPTURE_LOG", captureLog);
+
+        const runtime = new CodexCliRuntime();
+        const session = runtime.createSession({cwd: temp, mcpServers: []}, []);
+        const basePrompt = {
+            agentMode: AgentMode.getInitialAgentMode(),
+            modelId: ModelId.create("gpt-5", "medium"),
+            serviceTier: null,
+            disableSummary: false,
+            cwd: temp,
+            additionalDirectories: [],
+        };
+
+        await runtime.runPrompt({
+            ...basePrompt,
+            request: {
+                sessionId: session.sessionId,
+                prompt: [{type: "text", text: "new turn"}],
+            },
+        });
+        await runtime.runPrompt({
+            ...basePrompt,
+            request: {
+                sessionId: session.sessionId,
+                prompt: [{type: "text", text: "resume turn"}],
+            },
+        });
+
+        return fs.readFileSync(captureLog, "utf8")
+            .trim()
+            .split("\n")
+            .map(line => JSON.parse(line) as CliCapture);
+    } finally {
+        fs.rmSync(temp, {recursive: true, force: true});
+    }
+}
+
 describe("CodexCliRuntime", () => {
     afterEach(() => {
         vi.unstubAllEnvs();
+    });
+
+    it("adds exactly one multi-agent false override to new and resumed CLI launches", async () => {
+        vi.stubEnv("CODEX_ACP_MULTI_AGENT", "0");
+        const captures = await runTwoTurnCliCapture();
+        expect(captures).toHaveLength(2);
+        for (const capture of captures) {
+            const pairs = capture.argv.flatMap((arg, index, argv) =>
+                arg === "-c" && argv[index + 1] === "features.multi_agent=false"
+                    ? [index]
+                    : []
+            );
+            expect(pairs).toHaveLength(1);
+            // Override must appear before the prompt stdin marker and, on resume, before the subcommand.
+            expect(pairs[0]!).toBeLessThan(capture.argv.lastIndexOf("-"));
+        }
+        expect(captures[0]!.argv).not.toContain("resume");
+        expect(captures[1]!.argv).toContain("resume");
+        const resumeIndex = captures[1]!.argv.indexOf("resume");
+        const multiAgentIndex = captures[1]!.argv.indexOf("features.multi_agent=false");
+        expect(multiAgentIndex).toBeGreaterThan(-1);
+        expect(multiAgentIndex).toBeLessThan(resumeIndex);
+    });
+
+    it("does not force multi-agent on or off when the route env is absent", () => {
+        vi.stubEnv("CODEX_ACP_MULTI_AGENT", "");
+        expect(codexMultiAgentConfigArgs()).toEqual([]);
+    });
+
+    it("returns multi-agent false argv only for exact CODEX_ACP_MULTI_AGENT=0", () => {
+        expect(codexMultiAgentConfigArgs({})).toEqual([]);
+        expect(codexMultiAgentConfigArgs({CODEX_ACP_MULTI_AGENT: "1"})).toEqual([]);
+        expect(codexMultiAgentConfigArgs({CODEX_ACP_MULTI_AGENT: "false"})).toEqual([]);
+        expect(codexMultiAgentConfigArgs({CODEX_ACP_MULTI_AGENT: "true"})).toEqual([]);
+        expect(codexMultiAgentConfigArgs({CODEX_ACP_MULTI_AGENT: "0 "})).toEqual([]);
+        expect(codexMultiAgentConfigArgs({CODEX_ACP_MULTI_AGENT: "0"})).toEqual([
+            "-c",
+            "features.multi_agent=false",
+        ]);
+        expect(codexMultiAgentConfigArgs({CODEX_ACP_MULTI_AGENT: "0"}).join(" ")).not.toContain("true");
     });
 
     it("delivers multiline prompts via stdin instead of argv for new and resumed turns", async () => {

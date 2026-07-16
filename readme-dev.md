@@ -14,6 +14,7 @@ Set `CODEX_PATH` to run a different Codex binary; versions other than the one sp
 - `APP_SERVER_LOGS` - directory for adapter logs.
 - `CODEX_ACP_USE_CLI` - set to `1` to keep ACP but execute turns with `codex exec --json`.
 - `CODEX_ACP_CLI_MODEL` - model advertised and passed to `codex exec` in CLI runtime mode; defaults to `gpt-5`.
+- `CODEX_ACP_MULTI_AGENT` - set to exact `0` by the Codeg managed-delegation route to force `features.multi_agent=false` on every CLI `codex exec` and App Server session config; absent or any other value leaves native multi-agent config unchanged and never forces it on.
 
 ### Quick start
 
