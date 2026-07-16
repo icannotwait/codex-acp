@@ -1,17 +1,335 @@
 import {afterEach, describe, expect, it, vi} from "vitest";
+import type {ChildProcess} from "node:child_process";
+import {EventEmitter} from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import {Writable} from "node:stream";
 import type {McpServerStdio} from "@agentclientprotocol/sdk";
-import {CodexCliRuntime, codexExecModelArgs, mcpServerConfigArgs} from "../../CodexCliRuntime";
+import {
+    CodexCliRuntime,
+    codexExecModelArgs,
+    mcpServerConfigArgs,
+    writePromptToStdin,
+} from "../../CodexCliRuntime";
 import {AgentMode} from "../../AgentMode";
 import {ModelId} from "../../ModelId";
 import type {ServerNotification} from "../../app-server";
-import {writePosixNodeCommand} from "../acp-test-utils";
+import {writeCrossPlatformNodeCommand, writePosixNodeCommand} from "../acp-test-utils";
 
 describe("CodexCliRuntime", () => {
     afterEach(() => {
         vi.unstubAllEnvs();
+    });
+
+    it("delivers multiline prompts via stdin instead of argv for new and resumed turns", async () => {
+        const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cli-runtime-test-"));
+        try {
+            const captureLog = path.join(temp, "capture.jsonl");
+            const fakeCodex = writeCrossPlatformNodeCommand(temp, "codex", `
+const fs = require("node:fs");
+const chunks = [];
+process.stdin.on("data", chunk => chunks.push(Buffer.from(chunk)));
+process.stdin.on("end", () => {
+  const stdin = Buffer.concat(chunks).toString("utf8");
+  fs.appendFileSync(process.env.CAPTURE_LOG, JSON.stringify({
+    argv: process.argv.slice(2),
+    stdin,
+  }) + "\\n");
+  console.log(JSON.stringify({type: "thread.started", thread_id: "cli-thread-stdin"}));
+  console.log(JSON.stringify({type: "turn.completed"}));
+});
+            `);
+            vi.stubEnv("CODEX_PATH", fakeCodex);
+            vi.stubEnv("CODEX_HOME", path.join(temp, "codex-home"));
+            vi.stubEnv("CAPTURE_LOG", captureLog);
+
+            const multilineCore = [
+                "Line 1: start of delegated task",
+                'Line 2: quotes "double" and \'single\'',
+                "Line 3: shell metacharacters $HOME `whoami` && || ; | > < * ? #",
+                "Line 4: 中文内容与混合 English text",
+                "Line 5: path C:\\Users\\test\\file & (subshell)",
+            ].join("\n");
+            let multilinePrompt = multilineCore;
+            let padIndex = 0;
+            while (Buffer.byteLength(multilinePrompt, "utf8") <= 8191) {
+                multilinePrompt += `\nPad ${padIndex}: ${"x".repeat(120)}`;
+                padIndex += 1;
+            }
+            const resumePrompt = [
+                "Resume turn with LF lines",
+                "第二行：继续中文",
+                'meta: $PATH "quoted" & | ; < > * ?',
+                `payload:${"y".repeat(8200)}`,
+            ].join("\n");
+
+            const runtime = new CodexCliRuntime();
+            const session = runtime.createSession({cwd: temp, mcpServers: []}, []);
+            const basePrompt = {
+                agentMode: AgentMode.getInitialAgentMode(),
+                modelId: ModelId.create("gpt-5", "medium"),
+                serviceTier: null,
+                disableSummary: false,
+                cwd: temp,
+                additionalDirectories: [],
+            };
+
+            await runtime.runPrompt({
+                ...basePrompt,
+                request: {
+                    sessionId: session.sessionId,
+                    prompt: [{type: "text", text: multilinePrompt}],
+                },
+            });
+            expect(session.lastPrompt).toBe(multilinePrompt.slice(0, 160));
+
+            await runtime.runPrompt({
+                ...basePrompt,
+                request: {
+                    sessionId: session.sessionId,
+                    prompt: [{type: "text", text: resumePrompt}],
+                },
+            });
+            expect(session.lastPrompt).toBe(resumePrompt.slice(0, 160));
+
+            const captures = fs.readFileSync(captureLog, "utf8")
+                .trim()
+                .split("\n")
+                .map(line => JSON.parse(line) as {argv: string[]; stdin: string});
+
+            expect(captures).toHaveLength(2);
+            const first = captures[0]!;
+            const second = captures[1]!;
+
+            expect(first.argv.at(-1)).toBe("-");
+            expect(first.argv).not.toContain(multilinePrompt);
+            expect(first.argv.some(arg => arg.includes("Line 1: start of delegated task"))).toBe(false);
+            expect(first.stdin).toBe(multilinePrompt);
+            expect(Buffer.byteLength(first.stdin, "utf8")).toBeGreaterThan(8191);
+            expect(first.argv.slice(0, 3)).toEqual(["exec", "--json", "--skip-git-repo-check"]);
+            expect(first.argv).not.toContain("resume");
+
+            expect(second.argv.at(-1)).toBe("-");
+            expect(second.argv).toContain("resume");
+            expect(second.argv).toContain("cli-thread-stdin");
+            expect(second.argv.indexOf("resume")).toBeLessThan(second.argv.indexOf("cli-thread-stdin"));
+            expect(second.argv.indexOf("cli-thread-stdin")).toBeLessThan(second.argv.length - 1);
+            expect(second.argv).not.toContain(resumePrompt);
+            expect(second.argv.some(arg => arg.includes("Resume turn with LF lines"))).toBe(false);
+            expect(second.stdin).toBe(resumePrompt);
+        } finally {
+            fs.rmSync(temp, {recursive: true, force: true});
+        }
+    });
+
+    it("rejects when codex exits before the prompt is fully delivered on stdin", async () => {
+        const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cli-runtime-test-"));
+        try {
+            // Exit immediately without reading stdin so large writes hit a closed pipe.
+            const fakeCodex = writeCrossPlatformNodeCommand(temp, "codex", `
+console.log(JSON.stringify({type: "thread.started", thread_id: "cli-thread-epipe"}));
+console.log(JSON.stringify({type: "turn.completed"}));
+process.exit(0);
+            `);
+            vi.stubEnv("CODEX_PATH", fakeCodex);
+            vi.stubEnv("CODEX_HOME", path.join(temp, "codex-home"));
+
+            // Large enough that delivery failure is deterministic if the child never drains stdin.
+            const largePrompt = `undelivered-prompt\n${"z".repeat(256 * 1024)}`;
+
+            const runtime = new CodexCliRuntime();
+            const session = runtime.createSession({cwd: temp, mcpServers: []}, []);
+
+            // Must fail closed with a clear transport error — never report a completed turn
+            // when the prompt may not have been fully delivered. Late stream errors must not
+            // surface as unhandled exceptions after the promise settles.
+            await expect(runtime.runPrompt({
+                request: {
+                    sessionId: session.sessionId,
+                    prompt: [{type: "text", text: largePrompt}],
+                },
+                agentMode: AgentMode.getInitialAgentMode(),
+                modelId: ModelId.create("gpt-5", "medium"),
+                serviceTier: null,
+                disableSummary: false,
+                cwd: temp,
+                additionalDirectories: [],
+            })).rejects.toThrow(/Failed to deliver prompt to codex exec stdin|exited before prompt was fully delivered/i);
+        } finally {
+            fs.rmSync(temp, {recursive: true, force: true});
+        }
+    });
+
+    it("rejects when stdin closes before prompt delivery finishes", async () => {
+        const stdin = new Writable({
+            write(_chunk, _encoding, _callback) {
+                // Keep the write pending so destroy emits close without finish.
+            },
+        });
+        const child = Object.assign(new EventEmitter(), {
+            stdin,
+            exitCode: null,
+            signalCode: null,
+        }) as unknown as ChildProcess;
+
+        let outcome: {status: "resolved"} | {status: "rejected"; error: unknown} | undefined;
+        void writePromptToStdin(child, "prompt still being delivered").then(
+            () => {
+                outcome = {status: "resolved"};
+            },
+            error => {
+                outcome = {status: "rejected", error};
+            },
+        );
+
+        stdin.destroy();
+
+        await vi.waitFor(() => expect(outcome).toBeDefined(), {timeout: 500, interval: 1});
+        expect(outcome?.status).toBe("rejected");
+        expect(outcome && "error" in outcome ? outcome.error : null).toEqual(
+            expect.objectContaining({
+                message: "codex exec closed stdin before prompt was fully delivered",
+            }),
+        );
+    });
+
+    it("returns interrupted when cancel aborts prompt delivery on stdin", async () => {
+        const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cli-runtime-test-"));
+        try {
+            // Stay alive without draining stdin so a large write remains blocked until
+            // the runtime's cancellation kills the child (exercises incomplete-delivery catch).
+            const fakeCodex = writeCrossPlatformNodeCommand(temp, "codex", `
+setInterval(() => {}, 60_000);
+            `);
+            vi.stubEnv("CODEX_PATH", fakeCodex);
+            vi.stubEnv("CODEX_HOME", path.join(temp, "codex-home"));
+
+            const largePrompt = `cancel-during-write\n${"w".repeat(256 * 1024)}`;
+            const runtime = new CodexCliRuntime();
+            const session = runtime.createSession({cwd: temp, mcpServers: []}, []);
+
+            const completed = await runtime.runPrompt({
+                request: {
+                    sessionId: session.sessionId,
+                    prompt: [{type: "text", text: largePrompt}],
+                },
+                agentMode: AgentMode.getInitialAgentMode(),
+                modelId: ModelId.create("gpt-5", "medium"),
+                serviceTier: null,
+                disableSummary: false,
+                cwd: temp,
+                additionalDirectories: [],
+                shouldCancel: () => true,
+            });
+
+            expect(completed?.turn.status).toBe("interrupted");
+        } finally {
+            fs.rmSync(temp, {recursive: true, force: true});
+        }
+    });
+
+    it("aborts the live child before returning interrupted from an early failure", async () => {
+        const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cli-runtime-test-"));
+        try {
+            const fakeCodex = writeCrossPlatformNodeCommand(temp, "codex", `
+console.log(JSON.stringify({
+  type: "item.completed",
+  item: {id: "cancel-error", type: "agent_message", text: "trigger handler"},
+}));
+setTimeout(() => process.exit(0), 250);
+            `);
+            vi.stubEnv("CODEX_PATH", fakeCodex);
+            vi.stubEnv("CODEX_HOME", path.join(temp, "codex-home"));
+
+            const runtime = new CodexCliRuntime();
+            const session = runtime.createSession({cwd: temp, mcpServers: []}, []);
+            runtime.onServerNotification(session.sessionId, event => {
+                if (event.method === "item/agentMessage/delta") {
+                    throw new Error("synthetic notification failure");
+                }
+            });
+            const abortSession = vi.spyOn(runtime, "abortSession");
+
+            vi.useFakeTimers();
+            let completed: Awaited<ReturnType<CodexCliRuntime["runPrompt"]>>;
+            try {
+                completed = await runtime.runPrompt({
+                    request: {
+                        sessionId: session.sessionId,
+                        prompt: [{type: "text", text: "cancel before timer tick"}],
+                    },
+                    agentMode: AgentMode.getInitialAgentMode(),
+                    modelId: ModelId.create("gpt-5", "medium"),
+                    serviceTier: null,
+                    disableSummary: false,
+                    cwd: temp,
+                    additionalDirectories: [],
+                    shouldCancel: () => true,
+                });
+            } finally {
+                vi.useRealTimers();
+            }
+
+            // Let the fake self-terminate in the red case so a failed assertion cannot
+            // leave a test child alive or keep its cwd locked on Windows.
+            await new Promise(resolve => setTimeout(resolve, 350));
+
+            expect(completed?.turn.status).toBe("interrupted");
+            expect(abortSession).toHaveBeenCalledWith(session.sessionId);
+        } finally {
+            vi.useRealTimers();
+            fs.rmSync(temp, {recursive: true, force: true});
+        }
+    });
+
+    it("sends a single space on stdin for empty prompts while preserving empty lastPrompt", async () => {
+        const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cli-runtime-test-"));
+        try {
+            const captureLog = path.join(temp, "capture.json");
+            const fakeCodex = writeCrossPlatformNodeCommand(temp, "codex", `
+const fs = require("node:fs");
+const chunks = [];
+process.stdin.on("data", chunk => chunks.push(Buffer.from(chunk)));
+process.stdin.on("end", () => {
+  fs.writeFileSync(process.env.CAPTURE_LOG, JSON.stringify({
+    argv: process.argv.slice(2),
+    stdin: Buffer.concat(chunks).toString("utf8"),
+  }));
+  console.log(JSON.stringify({type: "thread.started", thread_id: "cli-thread-empty"}));
+  console.log(JSON.stringify({type: "turn.completed"}));
+});
+            `);
+            vi.stubEnv("CODEX_PATH", fakeCodex);
+            vi.stubEnv("CODEX_HOME", path.join(temp, "codex-home"));
+            vi.stubEnv("CAPTURE_LOG", captureLog);
+
+            const runtime = new CodexCliRuntime();
+            const session = runtime.createSession({cwd: temp, mcpServers: []}, []);
+
+            await runtime.runPrompt({
+                request: {
+                    sessionId: session.sessionId,
+                    prompt: [{type: "text", text: ""}],
+                },
+                agentMode: AgentMode.getInitialAgentMode(),
+                modelId: ModelId.create("gpt-5", "medium"),
+                serviceTier: null,
+                disableSummary: false,
+                cwd: temp,
+                additionalDirectories: [],
+            });
+
+            expect(session.lastPrompt).toBe("");
+            const capture = JSON.parse(fs.readFileSync(captureLog, "utf8")) as {
+                argv: string[];
+                stdin: string;
+            };
+            expect(capture.argv.at(-1)).toBe("-");
+            expect(capture.stdin).toBe(" ");
+        } finally {
+            fs.rmSync(temp, {recursive: true, force: true});
+        }
     });
 
     it("forwards the selected model and reasoning effort", () => {
@@ -111,12 +429,15 @@ describe("CodexCliRuntime", () => {
     it.skipIf(process.platform === "win32")("maps codex exec JSONL MCP tool calls into session notifications", async () => {
         const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cli-runtime-test-"));
         const fakeCodex = writePosixNodeCommand(temp, "codex", `
+process.stdin.resume();
+process.stdin.on("end", () => {
 console.log('{"type":"thread.started","thread_id":"cli-thread-1"}');
 console.log('{"type":"turn.started"}');
 console.log('{"type":"item.started","item":{"id":"mcp-1","type":"mcp_tool_call","server":"codeg-delegate","tool":"delegate_to_agent","arguments":{"task":"check"},"status":"in_progress"}}');
 console.log('{"type":"item.completed","item":{"id":"mcp-1","type":"mcp_tool_call","server":"codeg-delegate","tool":"delegate_to_agent","arguments":{"task":"check"},"status":"completed","result":{"content":[{"type":"text","text":"done"}],"structuredContent":null,"_meta":null}}}');
 console.log('{"type":"item.completed","item":{"id":"msg-1","type":"agent_message","text":"done"}}');
 console.log('{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}');
+});
         `);
         vi.stubEnv("CODEX_PATH", fakeCodex);
         vi.stubEnv("CODEX_HOME", path.join(temp, "codex-home"));
@@ -182,9 +503,12 @@ console.log('{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_t
         const argsLog = path.join(temp, "args.jsonl");
         const fakeCodex = writePosixNodeCommand(temp, "codex", `
 const fs = require("node:fs");
+process.stdin.resume();
+process.stdin.on("end", () => {
 fs.appendFileSync(process.env.ARGS_LOG, JSON.stringify(process.argv.slice(2)) + "\\n");
 console.log(JSON.stringify({type: "thread.started", thread_id: "cli-thread-1"}));
 console.log(JSON.stringify({type: "turn.completed"}));
+});
         `);
         vi.stubEnv("CODEX_PATH", fakeCodex);
         vi.stubEnv("CODEX_HOME", path.join(temp, "codex-home"));
@@ -236,7 +560,7 @@ console.log(JSON.stringify({type: "turn.completed"}));
             path.join(temp, "extra"),
             "resume",
             "cli-thread-1",
-            "second",
+            "-",
         ]);
 
         fs.rmSync(temp, {recursive: true, force: true});
@@ -247,9 +571,12 @@ console.log(JSON.stringify({type: "turn.completed"}));
         const argsLog = path.join(temp, "args.jsonl");
         const fakeCodex = writePosixNodeCommand(temp, "codex", `
 const fs = require("node:fs");
+process.stdin.resume();
+process.stdin.on("end", () => {
 fs.writeFileSync(process.env.ARGS_LOG, JSON.stringify(process.argv.slice(2)) + "\\n");
 console.log(JSON.stringify({type: "thread.started", thread_id: "cli-thread-1"}));
 console.log(JSON.stringify({type: "turn.completed"}));
+});
         `);
         vi.stubEnv("CODEX_PATH", fakeCodex);
         vi.stubEnv("CODEX_HOME", path.join(temp, "codex-home"));
@@ -320,8 +647,11 @@ console.log(JSON.stringify({type: "turn.completed"}));
             }),
         ].join("\n") + "\n", "utf8");
         const fakeCodex = writePosixNodeCommand(temp, "codex", `
+process.stdin.resume();
+process.stdin.on("end", () => {
 console.log('{"type":"thread.started","thread_id":"cli-thread-1"}');
 console.log('{"type":"turn.completed"}');
+});
 `);
         vi.stubEnv("CODEX_PATH", fakeCodex);
         vi.stubEnv("CODEX_HOME", codexHome);
@@ -367,6 +697,8 @@ console.log('{"type":"turn.completed"}');
         const fakeCodex = writePosixNodeCommand(temp, "codex", `
 const fs = require("node:fs");
 const path = require("node:path");
+process.stdin.resume();
+process.stdin.on("end", () => {
 const threadId = "cli-thread-compact";
 const rolloutDir = path.join(process.env.CODEX_HOME, "sessions", "2026", "07", "06");
 fs.mkdirSync(rolloutDir, {recursive: true});
@@ -378,6 +710,7 @@ fs.writeFileSync(path.join(rolloutDir, "rollout-2026-07-06T00-00-00-cli-thread-c
 console.log(JSON.stringify({type: "thread.started", thread_id: threadId}));
 console.log(JSON.stringify({type: "turn.started"}));
 console.log(JSON.stringify({type: "turn.completed"}));
+});
 `);
         vi.stubEnv("CODEX_PATH", fakeCodex);
         vi.stubEnv("CODEX_HOME", codexHome);
@@ -425,6 +758,8 @@ console.log(JSON.stringify({type: "turn.completed"}));
         const fakeCodex = writePosixNodeCommand(temp, "codex", `
 const fs = require("node:fs");
 const path = require("node:path");
+process.stdin.resume();
+process.stdin.on("end", () => {
 const threadId = "cli-thread-synthetic-compact";
 const rolloutPath = ${JSON.stringify(rolloutPath)};
 fs.mkdirSync(path.dirname(rolloutPath), {recursive: true});
@@ -439,6 +774,7 @@ console.log(JSON.stringify({type: "thread.started", thread_id: threadId}));
 console.log(JSON.stringify({type: "turn.started"}));
 console.log(JSON.stringify({type: "item.completed", item: {id: "msg-compact", type: "agent_message", text: "当前进展：\\n- summary from codex exec"}}));
 console.log(JSON.stringify({type: "turn.completed", usage: {input_tokens: 121258, cached_input_tokens: 4480, output_tokens: 2066, reasoning_output_tokens: 0, total_tokens: 123324}}));
+});
 `);
         vi.stubEnv("CODEX_PATH", fakeCodex);
         vi.stubEnv("CODEX_HOME", codexHome);

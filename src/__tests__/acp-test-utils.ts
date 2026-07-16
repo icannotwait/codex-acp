@@ -49,6 +49,20 @@ export function writePosixNodeCommand(directory: string, name: string, source: s
     return commandPath;
 }
 
+/**
+ * Cross-platform Node entrypoint for CODEX_PATH fakes.
+ * Windows: returns the .cjs path so resolveCodexCommandLaunch runs it via node.
+ * POSIX: returns a shell wrapper (same as writePosixNodeCommand).
+ */
+export function writeCrossPlatformNodeCommand(directory: string, name: string, source: string): string {
+    if (process.platform === "win32") {
+        const scriptPath = path.join(directory, `${name}.cjs`);
+        fs.writeFileSync(scriptPath, source, "utf8");
+        return scriptPath;
+    }
+    return writePosixNodeCommand(directory, name, source);
+}
+
 export interface SmartMockConfig {
     returnValues?: Map<string, (args: any[]) => any>;
 }

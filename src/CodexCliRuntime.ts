@@ -218,7 +218,6 @@ export class CodexCliRuntime {
 
         const args = buildCodexExecArgs({
             session,
-            prompt,
             modelId: params.modelId,
             agentMode: params.agentMode,
             serviceTier: params.serviceTier,
@@ -235,7 +234,9 @@ export class CodexCliRuntime {
             cwd: session.cwd,
             env: process.env,
             shell: launch.shell,
-            stdio: ["ignore", "pipe", "pipe"],
+            // Prompt body is written to stdin (argv uses "-") so Windows cmd.exe
+            // cannot truncate multiline / long prompts embedded in command args.
+            stdio: ["pipe", "pipe", "pipe"],
         });
         session.activeChild = child;
 
@@ -246,16 +247,37 @@ export class CodexCliRuntime {
         }, 200);
         cancelTimer.unref();
 
-        try {
-        if (!child.stdout || !child.stderr) {
-            throw new Error("codex exec did not expose stdout/stderr pipes");
-        }
+        // Preserve empty lastPrompt semantics, but never send zero-length stdin to
+        // codex exec (historical argv used a single space for empty prompts).
+        const stdinPrompt = prompt.length > 0 ? prompt : " ";
 
-        await Promise.all([
-            this.consumeJsonl(child.stdout, line => this.handleCliEvent(line, state)),
-            this.consumeJsonl(child.stderr, line => this.handleCliDiagnostic(line, state)),
-            waitForExit(child),
+        try {
+            if (!child.stdout || !child.stderr) {
+                throw new Error("codex exec did not expose stdout/stderr pipes");
+            }
+
+            await Promise.all([
+                writePromptToStdin(child, stdinPrompt),
+                this.consumeJsonl(child.stdout, line => this.handleCliEvent(line, state)),
+                this.consumeJsonl(child.stderr, line => this.handleCliDiagnostic(line, state)),
+                waitForExit(child),
             ]);
+        } catch (error) {
+            // Cancellation aborts the child mid-write; map transport failure to interrupted
+            // rather than surfacing a hard error when the caller requested cancel.
+            if (params.shouldCancel?.()) {
+                // The failure can beat the 200 ms cancellation poll. Signal the child
+                // before finally clears activeChild so a live process cannot be orphaned.
+                this.abortSession(session.sessionId);
+                return {
+                    threadId: session.sessionId,
+                    turn: createTurn(turnId, "interrupted", state.items, state.startedAt),
+                };
+            }
+            // Prompt-transport failures (EPIPE, premature stdin close, etc.) must not leave
+            // a live child orphaned after Promise.all rejects on the write side only.
+            this.abortSession(session.sessionId);
+            throw error;
         } finally {
             clearInterval(cancelTimer);
             if (session.activeChild === child) {
@@ -612,7 +634,6 @@ export function codexExecModelArgs(modelId: ModelId): string[] {
 
 function buildCodexExecArgs(params: {
     session: CliSession;
-    prompt: string;
     modelId: ModelId;
     agentMode: AgentMode;
     serviceTier: ServiceTier | null;
@@ -637,7 +658,9 @@ function buildCodexExecArgs(params: {
     if (isResume) {
         args.push("resume", params.session.cliThreadId!);
     }
-    args.push(params.prompt.length > 0 ? params.prompt : " ");
+    // "-" tells Codex CLI to read the prompt from stdin. Never put the prompt
+    // body on argv: Windows cmd.exe truncates at the first LF even inside quotes.
+    args.push("-");
     return args;
 }
 
@@ -1342,6 +1365,127 @@ function usageBreakdown(value: unknown): {
         outputTokens,
         reasoningOutputTokens,
     };
+}
+
+/**
+ * Write the exact prompt bytes to the child stdin and close it.
+ * Resolves only after stdin successfully finishes with no error. EPIPE,
+ * premature close, ERR_STREAM_DESTROYED, write-after-end, or child exit before
+ * delivery completion reject with a clear transport error. Always settles and
+ * destroys the stream as needed to avoid hangs. A no-op error listener remains
+ * after settlement so late stream errors cannot become unhandled.
+ */
+export function writePromptToStdin(child: ChildProcess, prompt: string): Promise<void> {
+    const stdin = child.stdin;
+    if (!stdin) {
+        return Promise.reject(new Error("codex exec did not expose stdin pipe"));
+    }
+
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let deliveryCompleted = false;
+
+        const retainNoopErrorListener = (): void => {
+            stdin.off("error", onStdinError);
+            // Node emits unhandled 'error' if no listeners remain; keep a sink.
+            stdin.on("error", () => {
+                // Intentionally no-op: delivery already settled.
+            });
+        };
+
+        const settle = (error?: Error): void => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            child.off("exit", onChildExit);
+            stdin.off("finish", onFinish);
+            stdin.off("close", onClose);
+            retainNoopErrorListener();
+            if (error) {
+                if (!stdin.destroyed) {
+                    stdin.destroy();
+                }
+                reject(error);
+            } else {
+                resolve();
+            }
+        };
+
+        const failDelivery = (message: string, cause?: unknown): void => {
+            if (settled) {
+                return;
+            }
+            const error = new Error(message);
+            if (cause instanceof Error) {
+                (error as Error & {cause?: unknown}).cause = cause;
+            }
+            settle(error);
+        };
+
+        const onStdinError = (error: NodeJS.ErrnoException): void => {
+            if (settled || deliveryCompleted) {
+                return;
+            }
+            failDelivery(
+                `Failed to deliver prompt to codex exec stdin: ${error.message}`,
+                error,
+            );
+        };
+
+        const onFinish = (): void => {
+            if (settled) {
+                return;
+            }
+            deliveryCompleted = true;
+            settle();
+        };
+
+        // Writable 'close' without a prior successful 'finish' means the pipe ended
+        // before delivery completed (including cases with no 'error' event). Fail closed
+        // so the promise cannot hang while the child stays alive.
+        const onClose = (): void => {
+            if (settled || deliveryCompleted) {
+                return;
+            }
+            failDelivery("codex exec closed stdin before prompt was fully delivered");
+        };
+
+        const onChildExit = (): void => {
+            if (settled || deliveryCompleted) {
+                return;
+            }
+            failDelivery("codex exec exited before prompt was fully delivered on stdin");
+        };
+
+        stdin.on("error", onStdinError);
+        stdin.once("finish", onFinish);
+        stdin.once("close", onClose);
+        child.once("exit", onChildExit);
+
+        if (child.exitCode !== null || child.signalCode !== null) {
+            failDelivery("codex exec exited before prompt was fully delivered on stdin");
+            return;
+        }
+
+        try {
+            stdin.end(Buffer.from(prompt, "utf8"), (error?: Error | null) => {
+                if (settled) {
+                    return;
+                }
+                if (error) {
+                    failDelivery(
+                        `Failed to deliver prompt to codex exec stdin: ${error.message}`,
+                        error,
+                    );
+                }
+                // Success path is driven by the 'finish' event so we only resolve
+                // after the stream has fully ended with no error.
+            });
+        } catch (error) {
+            onStdinError(error as NodeJS.ErrnoException);
+        }
+    });
 }
 
 function waitForExit(child: ChildProcess): Promise<void> {
