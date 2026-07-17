@@ -20,7 +20,7 @@ beforeEach(() => {
     // Prefer mutating process.env (not only vi.stubEnv) so later
     // vi.unstubAllEnvs() still leaves tests on an isolated home rather than
     // restoring the developer's real ~/.codex.
-    process.env.CODEX_HOME = codexHome;
+    process.env["CODEX_HOME"] = codexHome;
 });
 
 afterEach(() => {
