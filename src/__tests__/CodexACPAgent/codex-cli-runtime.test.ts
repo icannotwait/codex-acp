@@ -10,6 +10,7 @@ import {
     CodexCliRuntime,
     codexExecModelArgs,
     codexMultiAgentConfigArgs,
+    isStdioMcpServer,
     mcpServerConfigArgs,
     writePromptToStdin,
 } from "../../CodexCliRuntime";
@@ -524,6 +525,66 @@ process.stdin.on("end", () => {
             "-c",
             "mcp_servers.codeg-delegate.env={CODEG_TOKEN=\"secret\"}",
         ]);
+    });
+
+    it("classifies stdio vs typed MCP servers for prewarm eligibility", () => {
+        const stdio: McpServerStdio = {
+            name: "codeg-mcp",
+            command: "/tmp/codeg-mcp",
+            args: [],
+            env: [],
+        };
+        expect(isStdioMcpServer(stdio)).toBe(true);
+        expect(isStdioMcpServer({
+            name: "http-mcp",
+            type: "http",
+            url: "https://example.com/mcp",
+            headers: [],
+        })).toBe(false);
+    });
+
+    it("prewarms stdio MCP servers on createSession and stops them on close", async () => {
+        const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cli-prewarm-"));
+        const marker = path.join(temp, "prewarmed.marker");
+        const scriptPath = path.join(temp, "fake-mcp.cjs");
+        fs.writeFileSync(scriptPath, `
+const fs = require("fs");
+fs.writeFileSync(${JSON.stringify(marker)}, "ok");
+process.stdin.resume();
+setInterval(() => {}, 1 << 30);
+`, "utf8");
+
+        const runtime = new CodexCliRuntime();
+        const session = runtime.createSession({
+            cwd: temp,
+            mcpServers: [{
+                name: "fake-mcp",
+                command: process.execPath,
+                args: [scriptPath],
+                env: [],
+            }],
+        }, []);
+
+        await vi.waitFor(() => {
+            expect(fs.existsSync(marker)).toBe(true);
+        }, {timeout: 5_000});
+
+        expect(runtime.prewarmedMcpCount(session.sessionId)).toBe(1);
+        const child = runtime.getSession(session.sessionId)!.prewarmedMcpChildren[0]!;
+        const exited = new Promise<void>((resolve) => {
+            if (child.exitCode !== null) {
+                resolve();
+                return;
+            }
+            child.once("exit", () => resolve());
+        });
+
+        runtime.closeSession(session.sessionId);
+        expect(runtime.getSession(session.sessionId)).toBeUndefined();
+        expect(runtime.prewarmedMcpCount(session.sessionId)).toBe(0);
+        await exited;
+
+        fs.rmSync(temp, {recursive: true, force: true});
     });
 
     it.skipIf(process.platform === "win32")("maps codex exec JSONL MCP tool calls into session notifications", async () => {

@@ -1,4 +1,5 @@
 import * as acp from "@agentclientprotocol/sdk";
+import type {McpServerStdio} from "@agentclientprotocol/sdk";
 import {spawn, type ChildProcess} from "node:child_process";
 import crypto from "node:crypto";
 import fs, {type Dirent} from "node:fs";
@@ -29,6 +30,14 @@ interface CliSession {
     additionalDirectories: string[];
     mcpServers: acp.McpServer[];
     activeChild: ChildProcess | null;
+    /**
+     * Stdio MCP companions started at session open (CLI runtime has no
+     * `thread/start` MCP boot). Keeps processes like `codeg-mcp` alive so the
+     * host ready-lease can complete before the first `codex exec` turn.
+     * Killed on session close. Turn-time `codex exec` may re-spawn the same
+     * servers for tool stdio; secondary ready attaches are tools-only.
+     */
+    prewarmedMcpChildren: ChildProcess[];
     lastPrompt: string | null;
     updatedAt: number;
     lastKnownCompactionCount: number;
@@ -99,12 +108,14 @@ export class CodexCliRuntime {
             additionalDirectories,
             mcpServers: request.mcpServers ?? [],
             activeChild: null,
+            prewarmedMcpChildren: [],
             lastPrompt: null,
             updatedAt: Date.now(),
             lastKnownCompactionCount: 0,
             selectedModelId: null,
         };
         this.sessions.set(sessionId, session);
+        this.prewarmStdioMcpServers(session);
         return session;
     }
 
@@ -120,17 +131,24 @@ export class CodexCliRuntime {
             additionalDirectories,
             mcpServers: request.mcpServers ?? [],
             activeChild: null,
+            prewarmedMcpChildren: [],
             lastPrompt: persisted?.lastPrompt ?? null,
             updatedAt: persisted?.updatedAt ?? Date.now(),
             lastKnownCompactionCount: cliRolloutPath ? countCodexCompactions(cliRolloutPath) : 0,
             selectedModelId: persisted?.selectedModelId ?? null,
         };
         this.sessions.set(request.sessionId, session);
+        this.prewarmStdioMcpServers(session);
         return session;
     }
 
     getSession(sessionId: string): CliSession | undefined {
         return this.sessions.get(sessionId);
+    }
+
+    /** Test/diagnostics: number of still-tracked prewarmed stdio MCP children. */
+    prewarmedMcpCount(sessionId: string): number {
+        return this.sessions.get(sessionId)?.prewarmedMcpChildren.length ?? 0;
     }
 
     selectedModelId(sessionId: string): string | null {
@@ -139,6 +157,7 @@ export class CodexCliRuntime {
 
     closeSession(sessionId: string): void {
         this.abortSession(sessionId);
+        this.stopPrewarmedMcpServers(sessionId);
         this.handlers.delete(sessionId);
         this.sessions.delete(sessionId);
     }
@@ -153,6 +172,114 @@ export class CodexCliRuntime {
                 }
             }, 1_000).unref();
         }
+    }
+
+    /**
+     * Spawn stdio MCP servers immediately on CLI session open.
+     *
+     * App-server mode starts MCP during `thread/start` / resume. CLI mode only
+     * otherwise injects MCP as `codex exec -c mcp_servers.*` on the first turn,
+     * which is too late for the host's companion ready-lease (Connected waits
+     * for Ready before prompts run). Prewarming keeps stdin open so companions
+     * that block on MCP JSON-RPC (e.g. codeg-mcp after ready lease) stay alive
+     * for the session.
+     */
+    private prewarmStdioMcpServers(session: CliSession): void {
+        for (const server of session.mcpServers) {
+            if (!isStdioMcpServer(server)) {
+                continue;
+            }
+            const env: NodeJS.ProcessEnv = {...process.env};
+            for (const entry of server.env) {
+                env[entry.name] = entry.value;
+            }
+            try {
+                const child = spawn(server.command, server.args, {
+                    cwd: session.cwd,
+                    env,
+                    stdio: ["pipe", "pipe", "pipe"],
+                    windowsHide: true,
+                });
+                // Keep stdin open for the process lifetime (do not end the pipe).
+                child.stdin?.on("error", () => {
+                    // Ignore EPIPE if the companion exits first.
+                });
+                child.stdout?.resume();
+                child.stderr?.on("data", (chunk: Buffer | string) => {
+                    logger.log("Prewarmed MCP stderr", {
+                        sessionId: session.sessionId,
+                        name: server.name,
+                        chunk: chunk.toString().slice(0, 500),
+                    });
+                });
+                child.on("error", (error) => {
+                    logger.log("Prewarmed MCP spawn error", {
+                        sessionId: session.sessionId,
+                        name: server.name,
+                        command: server.command,
+                        error: error.message,
+                    });
+                });
+                child.on("exit", (code, signal) => {
+                    logger.log("Prewarmed MCP exited", {
+                        sessionId: session.sessionId,
+                        name: server.name,
+                        code,
+                        signal,
+                    });
+                    session.prewarmedMcpChildren = session.prewarmedMcpChildren.filter(
+                        (c) => c !== child
+                    );
+                });
+                session.prewarmedMcpChildren.push(child);
+                logger.log("Prewarmed stdio MCP at CLI session open", {
+                    sessionId: session.sessionId,
+                    name: server.name,
+                    command: server.command,
+                    args: server.args,
+                });
+            } catch (error) {
+                logger.log("Failed to prewarm stdio MCP", {
+                    sessionId: session.sessionId,
+                    name: server.name,
+                    command: server.command,
+                    error: error instanceof Error ? error.message : String(error),
+                });
+            }
+        }
+    }
+
+    private stopPrewarmedMcpServers(sessionId: string): void {
+        const session = this.sessions.get(sessionId);
+        if (!session) {
+            return;
+        }
+        for (const child of session.prewarmedMcpChildren) {
+            try {
+                child.stdin?.end();
+            } catch {
+                // ignore
+            }
+            if (!child.killed && child.exitCode === null) {
+                // Windows ignores POSIX signal names for many Node child processes;
+                // bare kill() maps to TerminateProcess there.
+                try {
+                    child.kill();
+                } catch {
+                    // already gone
+                }
+                setTimeout(() => {
+                    if (!child.killed && child.exitCode === null) {
+                        try {
+                            child.kill("SIGKILL");
+                        } catch {
+                            // ignore
+                        }
+                    }
+                }, 1_000).unref();
+            }
+        }
+        session.prewarmedMcpChildren = [];
     }
 
     onServerNotification(sessionId: string, handler: NotificationHandler): void {
@@ -702,6 +829,15 @@ export function mcpServerConfigArgs(mcpServers: acp.McpServer[]): string[] {
         }
     }
     return args;
+}
+
+/** ACP stdio MCP servers (no `type` field) — eligible for CLI session prewarm. */
+export function isStdioMcpServer(server: acp.McpServer): server is McpServerStdio {
+    if ("type" in server) {
+        return false;
+    }
+    return typeof (server as McpServerStdio).command === "string"
+        && (server as McpServerStdio).command.length > 0;
 }
 
 function promptText(prompt: acp.ContentBlock[]): string {
