@@ -3,7 +3,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "version": "1.1.2-mycodebuddy.3",
+  "version": "1.1.2-mycodebuddy.stop1",
   "description": "",
   "main": "dist/index.js",
   "bin": {
